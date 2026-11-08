@@ -286,9 +286,9 @@ struct OccSpan {
     int pieces = 0, seen = 0, bad = 0;
 };
 OccSpan occ;
-struct OccResolve { uint32_t query; BufferRef dst; };
+struct OccResolve { bool fill; uint32_t query; uint32_t value; BufferRef dst[2]; };   // (a query's copy, or a fill: guest memory and the mirror)
 std::vector<OccResolve> occ_pending;   // (the copies to record once outside the pass)
-int64_t st_occ_spans, st_occ_gpu, st_occ_zero, st_occ_queries, st_occ_est[5];
+int64_t st_occ_spans, st_occ_gpu, st_occ_zero, st_occ_queries, st_occ_est[5], st_occ_mirror;
 bool occ_on() {
     static const bool on = getenv("RX_VK_OCC_QUERIES") && atoi(getenv("RX_VK_OCC_QUERIES")) != 0 && par_threads() <= 1;
     return on;
@@ -317,7 +317,11 @@ void occ_begin_recording(Recording& r) {
 }
 void occ_emit(VkCommandBuffer cmd) {   // (outside any pass)
     for (const OccResolve& p : occ_pending)
-        vkCmdCopyQueryPoolResults(cmd, occ_pool, p.query, 1, p.dst.buffer, p.dst.offset, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        for (const BufferRef& d : p.dst) {
+            if (!d) continue;
+            if (!p.fill) vkCmdCopyQueryPoolResults(cmd, occ_pool, p.query, 1, d.buffer, d.offset, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            else vkCmdFillBuffer(cmd, d.buffer, d.offset, 4, p.value), vkCmdFillBuffer(cmd, d.buffer, d.offset + 4, 4, 0);
+        }
     occ_pending.clear();
 }
 void occ_end_query(VkCommandBuffer cmd) {
@@ -371,41 +375,58 @@ void occ_draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& da) {
     occ.seen++;
     if (d1 == d0) occ.bad |= OCC_SKIPPED;
 }
-/// NOP_REPORT_COUNTER of SAMPLES_PASSED: value is what the CPU writes now; the GPU's copy is queued when the span is whole
+/// NOP_REPORT_COUNTER of SAMPLES_PASSED: value is what the CPU writes now (guest memory, as before). The GPU writes the word
+/// too, on its timeline, in guest memory and in the pool's VRAM mirror (what the GPU's own readers bind: the game's culling
+/// compute reads these words there): the query's count when the span is whole, the same value otherwise
 void occ_report(VkCommandBuffer cmd, const NvnState& s, uint64_t addr, uint64_t& value) {
     if (!occ_pool || !occ.open || occ.state != &s) return;
     occ_end_query(cmd);
     occ.open = false;
     st_occ_spans++;
-    if (occ.seen == 0) {
-        value = 0;
-        st_occ_zero++;
-        return;
+    OccResolve r{};
+    uint64_t pool_lo = 0, pool_size = 0;
+    int mstate = -1;
+    const bool have = gpu_buffer_pair(addr, 8, &r.dst[0], &r.dst[1], &pool_lo, &pool_size, &mstate) && !(r.dst[0].offset & 7);
+    {   // (the first few pools the reports land in, once each: mirrored or not)
+        static uint64_t seen[6];
+        static int nseen;
+        bool is_new = nseen < 6;
+        for (int i = 0; i < nseen && is_new; i++) is_new = seen[i] != pool_lo;
+        if (is_new) {
+            seen[nseen++] = pool_lo;
+            logf("vk: occlusion: a report at %#llx: pool %#llx (%llu MB), mirror state %d%s%s", (unsigned long long)addr,
+                 (unsigned long long)pool_lo, (unsigned long long)(pool_size >> 20), mstate, r.dst[1] ? ", written to the mirror too" : "",
+                 have ? "" : " (no buffer: the CPU's value only)");
+        }
     }
-    if (occ.pieces != 1 || occ.last_query < 0) occ.bad |= OCC_PIECES;
-    BufferRef dst;
-    if (!occ.bad) {
-        dst = gpu_buffer(addr, 8);
-        if (!dst || (dst.offset & 7)) occ.bad |= OCC_NO_BUFFER;   // (a 64-bit copy wants an 8-byte offset)
+    if (have) memory_gpu_owned(host->gpu_guest(addr), 8);
+    bool whole = occ.seen > 0;
+    if (occ.seen == 0) value = 0, st_occ_zero++;
+    else {
+        if (occ.pieces != 1 || occ.last_query < 0) occ.bad |= OCC_PIECES;
+        if (!have) occ.bad |= OCC_NO_BUFFER;
+        if (occ.bad) {
+            for (int i = 0; i < 5; i++)
+                if (occ.bad & (1 << i)) st_occ_est[i]++;
+            whole = false;
+        }
     }
-    if (occ.bad) {
-        for (int i = 0; i < 5; i++)
-            if (occ.bad & (1 << i)) st_occ_est[i]++;
-        return;
-    }
-    occ_pending.push_back({(uint32_t)occ.last_query, dst});
+    if (!have) return;
+    if (whole) r.fill = false, r.query = (uint32_t)occ.last_query, st_occ_gpu++;
+    else r.fill = true, r.value = (uint32_t)value;
+    if (r.dst[1]) st_occ_mirror++;
+    occ_pending.push_back(r);
     if (!pass_open()) occ_emit(cmd);
-    st_occ_gpu++;
 }
 void occ_log(double frames) {
     if (!occ_pool) return;
-    static int64_t l_sp, l_gpu, l_zero, l_q, l_est[5];
+    static int64_t l_sp, l_gpu, l_zero, l_q, l_est[5], l_mir;
     logf("vk: occlusion: a frame: %.1f spans, %.1f counted on the GPU, %.1f with no draw (0), %.1f queries; as 4096: %.1f with a draw "
-         "skipped, %.1f over a pass or part end, %.1f interleaved, %.1f pool full, %.1f no buffer",
+         "skipped, %.1f over a pass or part end, %.1f interleaved, %.1f pool full, %.1f no buffer; %.1f written to a mirror too",
          (st_occ_spans - l_sp) / frames, (st_occ_gpu - l_gpu) / frames, (st_occ_zero - l_zero) / frames, (st_occ_queries - l_q) / frames,
          (st_occ_est[0] - l_est[0]) / frames, (st_occ_est[1] - l_est[1]) / frames, (st_occ_est[2] - l_est[2]) / frames,
-         (st_occ_est[3] - l_est[3]) / frames, (st_occ_est[4] - l_est[4]) / frames);
-    l_sp = st_occ_spans, l_gpu = st_occ_gpu, l_zero = st_occ_zero, l_q = st_occ_queries;
+         (st_occ_est[3] - l_est[3]) / frames, (st_occ_est[4] - l_est[4]) / frames, (st_occ_mirror - l_mir) / frames);
+    l_sp = st_occ_spans, l_gpu = st_occ_gpu, l_zero = st_occ_zero, l_q = st_occ_queries, l_mir = st_occ_mirror;
     for (int i = 0; i < 5; i++) l_est[i] = st_occ_est[i];
     static int64_t l_h[6];
     logf("vk: occlusion: the GPU's counts a frame: %.1f zero, %.1f under 64, %.1f under 1k, %.1f under 16k, %.1f under 256k, %.1f more",

@@ -894,12 +894,20 @@ void cap_buf_retire_holding(std::map<uint32_t, CapBuf>::iterator it, uint64_t co
         for (size_t i = 0; i < b.pages.size(); i++) {
             const uint32_t p = b.pages[i];
             const CapEntry e = cap_entry(p);
-            if (e.gen != g || e.slot != b.slots[i] || page_gen(p) != g) continue;   // (written since, or another capture's copy)
+            // (a page not held over whose entry still names g: cleared, as a retirement leaves it, since g now names the holdover
+            // buffer, smaller than this one: its old slot would read past it (a crash in memory_read_as_submitted))
+            if (e.gen != g || e.slot != b.slots[i] || page_gen(p) != g) {   // (written since, or another capture's copy)
+                if (e.gen == g) cap_entry_set(p, CapEntry{0, 0});
+                continue;
+            }
             const uint64_t a = (uint64_t)p << 12;
             auto pit = imported.upper_bound(a);
             if (pit != imported.begin()) {
                 --pit;
-                if (a < pit->second.hi && pit->second.mstate == Pool::MIRROR_ON && pit->second.synced_gen >= g) continue;   // (the mirror has it)
+                if (a < pit->second.hi && pit->second.mstate == Pool::MIRROR_ON && pit->second.synced_gen >= g) {   // (the mirror has it)
+                    cap_entry_set(p, CapEntry{0, 0});
+                    continue;
+                }
             }
             keep.push_back(p), from.push_back(b.slots[i]);
         }
@@ -2005,25 +2013,59 @@ void memory_cpu_owned(uint64_t guest, uint64_t size) {
     }
     for (uint64_t a = guest & ~7ull; a < guest + size; a += 8) cpu_words_new.push_back(a);
 }
+// (hookshot) the words the GPU writes in guest memory and in the mirror alike (the occlusion counts, vk_replay.cpp occ_report):
+// a mirror sync copying a captured or live page over them would put the CPU's placeholder back over the GPU's count
+std::vector<uint64_t> gpu_words, gpu_words_new;
+void gpu_words_merge() {   // (holding cpu_words_mu)
+    if (gpu_words_new.empty()) return;
+    std::sort(gpu_words_new.begin(), gpu_words_new.end());
+    gpu_words_new.erase(std::unique(gpu_words_new.begin(), gpu_words_new.end()), gpu_words_new.end());
+    const size_t mid = gpu_words.size();
+    gpu_words.insert(gpu_words.end(), gpu_words_new.begin(), gpu_words_new.end());
+    std::inplace_merge(gpu_words.begin(), gpu_words.begin() + (ptrdiff_t)mid, gpu_words.end());
+    gpu_words.erase(std::unique(gpu_words.begin(), gpu_words.end()), gpu_words.end());
+    gpu_words_new.clear();
+}
+void memory_gpu_owned(uint64_t guest, uint64_t size) {
+    if (!guest || !size) return;
+    std::lock_guard lk(cpu_words_mu);
+    if (gpu_words.size() + gpu_words_new.size() > 65536) {
+        gpu_words_merge();
+        if (gpu_words.size() > 65536) gpu_words.clear();
+        if (gpu_words_new.size() > 65536) gpu_words_new.clear();
+    }
+    for (uint64_t a = guest & ~7ull; a < guest + size; a += 8) gpu_words_new.push_back(a);
+}
 namespace {
 // (a write-back's runs with the replay's own words cut out of them: runs of p, offsets in the pool)
+// (runs with the given words cut out of them: dstOffset is the offset in the pool, srcOffset moves with it, so a capture's
+// runs (source in the capture's buffer) are cut the same way as a write-back's or a live sync's)
+void cut_words_of(const Pool& p, std::vector<VkBufferCopy>& runs, const std::vector<uint64_t>& words) {
+    if (words.empty()) return;
+    std::vector<VkBufferCopy> out;
+    for (const VkBufferCopy& r : runs) {
+        uint64_t at = r.dstOffset;
+        const uint64_t end = r.dstOffset + r.size;
+        const uint64_t shift = r.srcOffset - r.dstOffset;   // (unsigned: wraps and unwraps)
+        // A run can start inside an owned word: include that word when cutting the overlap.
+        for (auto it = std::lower_bound(words.begin(), words.end(), (p.lo + at) & ~7ull); it != words.end() && *it < p.lo + end; ++it) {
+            const uint64_t w = *it - p.lo;
+            if (w > at) out.push_back({at + shift, at, w - at});
+            at = std::max(at, w + 8);
+        }
+        if (end > at) out.push_back({at + shift, at, end - at});
+    }
+    runs.swap(out);
+}
 void cut_cpu_words(const Pool& p, std::vector<VkBufferCopy>& runs) {
     std::lock_guard lk(cpu_words_mu);
     cpu_words_merge();
-    if (cpu_words.empty()) return;
-    std::vector<VkBufferCopy> out;
-    for (const VkBufferCopy& r : runs) {
-        uint64_t at = r.srcOffset;
-        const uint64_t end = r.srcOffset + r.size;
-        // A run can start inside an owned word: include that word when cutting the overlap.
-        for (auto it = std::lower_bound(cpu_words.begin(), cpu_words.end(), (p.lo + at) & ~7ull); it != cpu_words.end() && *it < p.lo + end; ++it) {
-            const uint64_t w = *it - p.lo;
-            if (w > at) out.push_back({at, at, w - at});
-            at = std::max(at, w + 8);
-        }
-        if (end > at) out.push_back({at, at, end - at});
-    }
-    runs.swap(out);
+    cut_words_of(p, runs, cpu_words);
+}
+void cut_gpu_words(const Pool& p, std::vector<VkBufferCopy>& runs) {
+    std::lock_guard lk(cpu_words_mu);
+    gpu_words_merge();
+    cut_words_of(p, runs, gpu_words);
 }
 
 // ---- a pool remade larger (a 16 MB chunk the game's next pool runs past): the old one leaves the table but stays
@@ -2135,7 +2177,10 @@ void mirror_sync(Pool& p) {
         page++;
     }
     if (run_hi) runs.push_back({run_lo, run_lo, run_hi - run_lo});
+    for (auto& [buf, rs] : cap_runs) cut_gpu_words(p, rs);   // (hookshot: the counts the GPU wrote into the mirror stay)
+    cut_gpu_words(p, runs);
     for (const auto& [buf, rs] : cap_runs) {
+        if (rs.empty()) continue;
         GprofSpan gp(upload_command_buffer(), "msync copies (CPU pages from a capture -> mirror)");
         gp.items = (int)rs.size();
         vkCmdCopyBuffer(upload_command_buffer(), buf, p.mirror, (uint32_t)rs.size(), rs.data());
@@ -2210,6 +2255,23 @@ BufferRef gpu_buffer(uint64_t gpu, uint64_t size) {
     if (!p) return {};
     if (p->last_value < mem_rec_value) p->last_value = mem_rec_value;   // (in use: not given back under it, imports_give_back)
     return {p->buffer, guest - p->lo, size, p->address + (guest - p->lo)};
+}
+
+bool gpu_buffer_pair(uint64_t gpu, uint64_t size, BufferRef* guest, BufferRef* mirror, uint64_t* pool_lo, uint64_t* pool_size, int* mstate) {
+    *guest = *mirror = BufferRef{};
+    *pool_lo = *pool_size = 0, *mstate = -1;
+    uint64_t avail = 0;
+    if (!host->gpu_ptr(gpu, &avail) || avail < size) return false;
+    const uint64_t g = host->gpu_guest(gpu);
+    std::lock_guard lk(pools_mu);
+    Pool* p = pool_of(g, size);
+    if (!p) return false;
+    if (p->last_value < mem_rec_value) p->last_value = mem_rec_value;
+    const uint64_t off = g - p->lo;
+    *guest = {p->buffer, off, size, p->address + off};
+    if (p->mstate == Pool::MIRROR_ON && p->mirror) *mirror = {p->mirror, off, size, 0};
+    *pool_lo = p->lo, *pool_size = p->hi - p->lo, *mstate = (int)p->mstate;
+    return true;
 }
 
 void memory_pool_created(uint64_t gpu, uint64_t size) {
