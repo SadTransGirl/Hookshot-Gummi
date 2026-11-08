@@ -275,6 +275,8 @@ VkQueryPool occ_pool = VK_NULL_HANDLE;
 bool occ_pool_failed = false;
 int occ_slot = -1;        // (the recording being made: its range of the pool)
 uint32_t occ_used = 0;    // (queries of that range used)
+uint32_t occ_slot_used[kRecordings];   // (each slot's, for the readback when it comes round)
+int64_t st_occ_hist[6];                // (the counts the GPU gave: 0, 1-63, 64-1023, 1024-16383, 16384-262143, more)
 enum { OCC_SKIPPED = 1, OCC_PIECES = 2, OCC_INTERLEAVED = 4, OCC_POOL_FULL = 8, OCC_NO_BUFFER = 16 };
 struct OccSpan {
     bool open = false;
@@ -303,6 +305,13 @@ void occ_begin_recording(Recording& r) {
              kOccPerSlot, dev.features.occlusionQueryPrecise ? ", precise" : ", not precise");
     }
     if (!occ_pool) return;
+    if (const uint32_t n = occ_slot_used[r.slot]) {   // (its last use is done (recording_wait): what the GPU counted, for the log)
+        static std::vector<uint64_t> got;
+        got.resize(n);
+        if (vkGetQueryPoolResults(dev.device, occ_pool, (uint32_t)r.slot * kOccPerSlot, n, n * 8, got.data(), 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+            for (const uint64_t v : got) st_occ_hist[v == 0 ? 0 : v < 64 ? 1 : v < 1024 ? 2 : v < 16384 ? 3 : v < 262144 ? 4 : 5]++;
+        occ_slot_used[r.slot] = 0;
+    }
     vkCmdResetQueryPool(r.cmd, occ_pool, (uint32_t)r.slot * kOccPerSlot, kOccPerSlot);
     occ_slot = r.slot, occ_used = 0;
 }
@@ -337,6 +346,7 @@ void occ_draw_hook(VkCommandBuffer cmd, const void* state) {   // (draw(): insid
         return;
     }
     const uint32_t q = (uint32_t)occ_slot * kOccPerSlot + occ_used++;
+    occ_slot_used[occ_slot] = occ_used;
     static const bool precise = dev.features.occlusionQueryPrecise && !(getenv("RX_VK_OCC_PRECISE") && atoi(getenv("RX_VK_OCC_PRECISE")) == 0);
     vkCmdBeginQuery(cmd, occ_pool, q, precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
     occ.query = (int32_t)q;
@@ -397,6 +407,11 @@ void occ_log(double frames) {
          (st_occ_est[3] - l_est[3]) / frames, (st_occ_est[4] - l_est[4]) / frames);
     l_sp = st_occ_spans, l_gpu = st_occ_gpu, l_zero = st_occ_zero, l_q = st_occ_queries;
     for (int i = 0; i < 5; i++) l_est[i] = st_occ_est[i];
+    static int64_t l_h[6];
+    logf("vk: occlusion: the GPU's counts a frame: %.1f zero, %.1f under 64, %.1f under 1k, %.1f under 16k, %.1f under 256k, %.1f more",
+         (st_occ_hist[0] - l_h[0]) / frames, (st_occ_hist[1] - l_h[1]) / frames, (st_occ_hist[2] - l_h[2]) / frames,
+         (st_occ_hist[3] - l_h[3]) / frames, (st_occ_hist[4] - l_h[4]) / frames, (st_occ_hist[5] - l_h[5]) / frames);
+    for (int i = 0; i < 6; i++) l_h[i] = st_occ_hist[i];
 }
 
 /// The next recording slot, begun, for the submission that will signal value
