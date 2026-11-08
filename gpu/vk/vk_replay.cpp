@@ -316,6 +316,8 @@ void occ_end_query(VkCommandBuffer cmd) {
     vkCmdEndQuery(cmd, occ_pool, (uint32_t)occ.query);
     occ.last_query = occ.query, occ.query = -1;
 }
+} // namespace
+// (the hooks vk_draw.cpp calls: mkwvk's, not the anonymous namespace's)
 void occ_pass_ending(VkCommandBuffer cmd) {
     if (occ_pool) occ_end_query(cmd);
 }
@@ -341,6 +343,7 @@ void occ_draw_hook(VkCommandBuffer cmd, const void* state) {   // (draw(): insid
     occ.pieces++;
     st_occ_queries++;
 }
+namespace {
 /// NOP_RESET_COUNTER of SAMPLES_PASSED: a span begins (one without its report is dropped)
 void occ_reset(VkCommandBuffer cmd, const NvnState& s) {
     if (!occ_pool) return;
