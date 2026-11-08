@@ -32,6 +32,7 @@ struct NvnState {
     // (hookshot) what bind_gen was when a stage's textures, samplers or images (tex_gen) or its storage buffers (ssbo_gen) last changed: the
     // driver banks c2 and c0 of a graphics stage are made from those alone, so a draw after another uniform buffer's bind keeps its banks
     uint64_t tex_gen[kNvnStages] = {}, ssbo_gen[kNvnStages] = {};
+    uint64_t desc_gen = 0;       // the same, except a program change: that program's descriptors stay usable
     float viewport[16][4]{};
     float depth_near = 0.0f, depth_far = 1.0f;
     int32_t scissor[4]{0, 0, 0, 0};
