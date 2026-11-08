@@ -256,6 +256,13 @@ Row rows[] = {
      "Inverts horizontal look (left/right) on the right analog stick."},
     {TAB_CONTROLS, "Invert camera Y", &opts.invert_cam_y, 0, 1, 1, tx_onoff,
      "Inverts vertical look (up/down) on the right analog stick."},
+    {TAB_CONTROLS, "Motion aiming", &opts.motion, 0, 1, 1, tx_onoff,
+     "Aims with the controller's gyroscope, as on the Switch, on a pad SDL reads sensors from: DualSense, DualShock 4, Switch Pro, "
+     "Steam Controller and others. Hold the pad flat or upright, as you like."},
+    {TAB_CONTROLS, "Motion sensitivity", &opts.motion_sens, 10, 500, 10, tx_sens,
+     "How far the aim turns for a turn of the controller. 1.00 is the Switch's own rate."},
+    {TAB_CONTROLS, "Invert motion vertical", &opts.motion_invert, 0, 1, 1, tx_onoff,
+     "Swaps up and down for motion aiming: tilting the pad toward you aims up."},
     {TAB_CONTROLS, "Layout preset", &opts.pad_layout, 0, 3, 1, tx_pad_layout,
      "Nintendo (default Switch order), Xbox / PC (A for action/talk), or Swap Face. Individual bindings switch this to Custom."},
     {TAB_CONTROLS, "Controls", nullptr, 0, 0, 0, nullptr,   // (hookshot: opens its page)

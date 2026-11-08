@@ -757,8 +757,110 @@ HLE(_ZN2nn3hid21ShowControllerSupportEPNS0_27ControllerSupportResultInfoERKNS0_2
 /* Handles: six-axis ones are opaque u32s; a vibration handle is {u8 style type (3 = full key), u8 npad id, u8 device
    index (0 left, 1 right), u8 reserved}, which the SDK's vibration classes read. Vibration goes nowhere yet. */
 HLE(_ZN2nn3hid23GetSixAxisSensorHandlesEPNS0_19SixAxisSensorHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE) {
-    for (int i = 0; i < (int)ARG(1); i++) G32(ARG(0) + 4 * (uint64_t)i) = 0x100u + (uint32_t)i;
+    /* (hookshot, issue 112, spluton) The game asks for two handles (a Joy-Con pair) and runs its motion aiming only when the
+       answer is three or more (its third source, the console's own, is the branch that flags motion as active): three, all
+       filled, with the game's own count when it asks for more */
+    const int n = (int)ARG(1) < 3 ? 3 : (int)ARG(1) > 16 ? 16 : (int)ARG(1);
+    for (int i = 0; i < n; i++) G32(ARG(0) + 4 * (uint64_t)i) = 0x100u + (uint32_t)i;
+    RET(n);
+}
+/* SensorFusion: the console's own orientation estimate, which the game may ask for beside the six-axis sensors. Handles in a
+   range of their own; the states come through GetSixAxisSensorStates */
+HLE(_ZN2nn3hid22GetSensorFusionHandlesEPNS0_18SensorFusionHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE) {
+    for (int i = 0; i < (int)ARG(1); i++) G32(ARG(0) + 4 * (uint64_t)i) = 0x200u + (uint32_t)i;
     RET((int)ARG(1));
+}
+HLE(_ZN2nn3hid20FinalizeSensorFusionEv) {}
+/* (hookshot) Motion aiming from the pad's sensors (pad_sdl.c hos_sdl_sensors; the Insert menu's Motion aiming, Motion
+   sensitivity and Invert motion vertical). What the game wants, found by spluton and Link-22 (issue 112): it aims in the
+   controller's own body frame and folds the euler angles, the pitch rate and the acceleration into its aim's recenter, which
+   cancels anything not body-relative and neutral. So the state goes out as: the angles zero, the acceleration pinned to
+   at-rest, the vertical aim as a pure tilt matrix Rx(pitch) integrated from the body-frame pitch rate, and the horizontal as
+   the yaw rate in turns per second (a Switch's unit, as Eden gives it: SDL's rad/s over 2 pi). The body-frame rates come from
+   an up-vector complementary filter (up predicted from the gyro, pulled toward the measured gravity when |a| is 0.65..1.35 g),
+   so the pad may be held flat or upright. v: the 18 floats from +0x10 of a SixAxisSensorState (acceleration, angular
+   velocity, angle, direction matrix); 1 when a pad with sensors is on and the option is */
+static int motion_states(float v[18]) {
+    int hos_sdl_sensors(float accel[3], float gyro[3]);   /* pad_sdl.c */
+    static float bias[3], up[3] = {0, 1, 0}, pitch;
+    static int bias_n, up_ready, said;
+    static int64_t last_ns;
+    float accel[3], gyro[3];
+    if (!rx_option(18, 0) || !hos_sdl_sensors(accel, gyro)) {
+        up_ready = 0, last_ns = 0, pitch = 0;
+        return 0;
+    }
+    if (!said) said = 1, hos_log("hid: motion aiming from the pad's sensors (acceleration in m/s^2, angular velocity in rad/s)");
+    const int64_t now = hos_now_ns();
+    float dt = last_ns ? (float)(now - last_ns) / 1e9f : 0.004f;
+    last_ns = now;
+    if (dt < 0.001f || dt > 0.05f) dt = 0.004f;
+    /* the gyroscope's bias, learned while the pad is still (under 0.08 rad/s) */
+    {
+        const float bx = gyro[0] - bias[0], by = gyro[1] - bias[1], bz = gyro[2] - bias[2];
+        if (bx * bx + by * by + bz * bz < 0.0064f) {
+            const float k = bias_n < 256 ? 0.06f : 0.004f;
+            bias[0] += bx * k, bias[1] += by * k, bias[2] += bz * k;
+            bias_n++;
+        }
+    }
+    const float w[3] = {gyro[0] - bias[0], gyro[1] - bias[1], gyro[2] - bias[2]};
+    /* the up vector: predicted from the gyroscope, pulled toward the measured gravity while its size is plausible */
+    const float g = 9.80665f, alen = sqrtf(accel[0] * accel[0] + accel[1] * accel[1] + accel[2] * accel[2]);
+    const int valid = alen > 0.65f * g && alen < 1.35f * g;
+    if (!up_ready) {
+        if (valid) {
+            for (int k = 0; k < 3; k++) up[k] = accel[k] / alen;
+            up_ready = 1;
+        }
+    } else {
+        float p[3] = {up[0] + (-w[1] * up[2] + w[2] * up[1]) * dt, up[1] + (-w[2] * up[0] + w[0] * up[2]) * dt,
+                      up[2] + (-w[0] * up[1] + w[1] * up[0]) * dt};
+        float len = sqrtf(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]);
+        if (len > 0.001f) {
+            for (int k = 0; k < 3; k++) p[k] /= len;
+            if (valid) {
+                const float o[3] = {accel[0] / alen, accel[1] / alen, accel[2] / alen};
+                const float dir = o[0] * p[0] + o[1] * p[1] + o[2] * p[2], corr = dt / (0.5f + dt);
+                for (int k = 0; k < 3; k++) p[k] += ((dir < 0.0f ? -o[k] : o[k]) - p[k]) * corr;
+                len = sqrtf(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]);
+                if (len > 0.001f)
+                    for (int k = 0; k < 3; k++) p[k] /= len;
+            }
+            memcpy(up, p, sizeof up);
+        }
+    }
+    /* the body frame: right, up and forward from the up vector */
+    float right[3] = {1.0f - up[0] * up[0], -up[0] * up[1], -up[0] * up[2]};
+    float rlen = sqrtf(right[0] * right[0] + right[1] * right[1] + right[2] * right[2]);
+    if (rlen < 0.1f) {
+        right[0] = -up[0] * up[2], right[1] = -up[1] * up[2], right[2] = 1.0f - up[2] * up[2];
+        rlen = sqrtf(right[0] * right[0] + right[1] * right[1] + right[2] * right[2]);
+    }
+    for (int k = 0; k < 3; k++) right[k] /= rlen;
+    const float forward[3] = {right[1] * up[2] - right[2] * up[1], right[2] * up[0] - right[0] * up[2], right[0] * up[1] - right[1] * up[0]};
+    const float pitch_rate = w[0] * right[0] + w[1] * right[1] + w[2] * right[2];   /* (tilting the pad's top toward you) */
+    const float yaw_rate = w[0] * up[0] + w[1] * up[1] + w[2] * up[2];               /* (turning it about the up axis) */
+    (void)forward;
+    const float sens = (float)rx_option(19, 100) / 100.0f;
+    float vert = -pitch_rate * sens, horiz = yaw_rate * sens;   /* (the pad tilted toward you aims down, as a Switch) */
+    if (rx_option(20, 0)) vert = -vert;
+    pitch += vert * dt;
+    if (pitch > 3.1415927f) pitch -= 6.2831855f;
+    if (pitch < -3.1415927f) pitch += 6.2831855f;
+    const float c = cosf(pitch), s = sinf(pitch);
+    const float out[18] = {0, 0, -1,                        /* acceleration: at rest (the game's recenter) */
+                           0, horiz * 0.15915494f, 0,       /* angular velocity: the yaw rate alone, in turns per second */
+                           0, 0, 0,                         /* angles: neutral */
+                           1, 0, 0, 0, c, -s, 0, s, c};     /* direction: the tilt about x */
+    memcpy(v, out, sizeof out);
+    static int64_t dbg_next;
+    if (getenv("HOS_MOTION_DEBUG") && now >= dbg_next) {   /* (twice a second: the pad's axes, to check a new pad) */
+        dbg_next = now + 500000000LL;
+        hos_log("hid: gyro (%+.2f, %+.2f, %+.2f) up (%+.2f, %+.2f, %+.2f) pitch rate %+.2f yaw rate %+.2f aim pitch %+.2f",
+                gyro[0], gyro[1], gyro[2], up[0], up[1], up[2], pitch_rate, yaw_rate, pitch);
+    }
+    return 1;
 }
 HLE(_ZN2nn3hid22GetSixAxisSensorStatesEPNS0_18SixAxisSensorStateEiRKNS0_19SixAxisSensorHandleE) {
     static int64_t six_sampling;
@@ -766,12 +868,14 @@ HLE(_ZN2nn3hid22GetSixAxisSensorStatesEPNS0_18SixAxisSensorStateEiRKNS0_19SixAxi
     const int count = (int)ARG(1) < 1 ? 0 : (int)ARG(1) > 32 ? 32 : (int)ARG(1);
     const int64_t s = ++six_sampling;
     static const float at_rest[18] = {0, 0, -1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1};
+    float v[18];
+    const int motion = motion_states(v);
     for (int i = 0; i < count; i++) {
         const uint64_t e = out + (uint64_t)i * 0x60;
         memset(GP(e), 0, 0x60);
         G64(e) = 5000000;
         G64(e + 8) = (uint64_t)(s - i);
-        memcpy(GP(e + 0x10), at_rest, sizeof at_rest);
+        memcpy(GP(e + 0x10), motion ? v : at_rest, sizeof at_rest);
         G32(e + 0x58) = 1;
     }
     RET(count);

@@ -55,3 +55,8 @@ int16_t hos_sdl_pad_axis(void *pad, int axis);
 const char *hos_sdl_pad_name(void *pad);
 int32_t hos_sdl_pad_id(void *pad);
 void hos_sdl_pad_rumble(void *pad, uint16_t low, uint16_t high, uint32_t ms);
+/* (hookshot) the pad's motion sensors (DualSense, DualShock 4, Switch Pro, Steam Controller and others over SDL's HIDAPI drivers;
+   SDL 2.0.14 on): both turned on when the pad has an accelerometer and a gyroscope. The readings in SDL's units and axes:
+   acceleration in m/s^2 and angular velocity in rad/s, x right, y up, z toward the player */
+int hos_sdl_pad_sensors_enable(void *pad);   /* 1 when the pad has both and they are on */
+int hos_sdl_pad_sensors(void *pad, float accel[3], float gyro[3]);   /* 1 when both were read */
