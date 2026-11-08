@@ -1196,7 +1196,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
     }
 }
 
-// ---- chunks: a long submission goes to the GPU in parts (RX_VK_CHUNK=<draws and dispatches a part>, default 360;
+// ---- chunks: a long submission goes to the GPU in parts (RX_VK_CHUNK=<draws and dispatches a part>, default 120;
 // 0: whole), so the GPU starts on its first part while the rest is recorded. The game waits for its fences within
 // the frame: with the whole submission recorded before the GPU saw any of it, its wait was the replay's time plus
 // the GPU's. Only the last part signals the submission's timeline value; the parts' slots free with it. ----
@@ -1211,12 +1211,14 @@ constexpr int kMaxParts = 32;
 constexpr int kMaxBatch = 6;   // (three recording threads: more segments only took slots and submits)
 
 void maybe_split(VkCommandBuffer& cmd) {
-    // (360, from 120: each part costs a queue submit, a write-back pass with its two full barriers, two command-pool
-    // resets, a cold restart of every per-draw cache (draw_begin_recording) and a re-sync of every mirrored pool at its
-    // next bind (mirror_epoch): ~12 times a 1,500-draw frame at 120, ~4 at 360. A part also ends once its stream is half
-    // used, so a longer part cannot run the 24 MB stream out and drop draws. RX_VK_CHUNK=120 restores the old value, to
-    // A/B against: the GPU starts later on the frame's first part by the draws added)
-    static const int64_t every = getenv("RX_VK_CHUNK") ? atoll(getenv("RX_VK_CHUNK")) : 360;
+    // (each part costs a queue submit, a write-back pass with its two full barriers, two command-pool resets, a cold
+    // restart of every per-draw cache (draw_begin_recording) and a re-sync of every mirrored pool at its next bind
+    // (mirror_epoch): ~12 times a 1,500-draw frame at 120. RX_VK_CHUNK=360 is the value to A/B: ~4 parts a frame, but a
+    // part three times as long is a GPU packet three times as long, and a device loss was seen once at an area load with
+    // it (frame 10646, a write-back then shadow draws at 12288x12288; Windows stops a packet past ~2 s), so 120 stays the
+    // default until that is ruled out. A part also ends once a fixed-size stream is half used (stream_crowded), so a
+    // longer part cannot run it out and drop draws)
+    static const int64_t every = getenv("RX_VK_CHUNK") ? atoll(getenv("RX_VK_CHUNK")) : 120;
     if (!rec_cur || every <= 0 || rec_parts + 1 >= kMaxParts || dump_on()) return;
     if (++part_work < every && !stream_crowded()) return;
     end_pass(cmd);

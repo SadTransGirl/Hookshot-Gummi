@@ -2177,7 +2177,9 @@ bool stream_holds(const uint8_t* base, uint64_t at, uint64_t n) {
     return cur && cur->mapped == base && n && at + n >= at && at + n <= cur->used;
 }
 bool stream_crowded() {
-    return cur && cur->used > kStream / 2;   // (vk_replay.cpp maybe_split: the part ends before its stream can fill)
+    // (vk_replay.cpp maybe_split: the part ends before its stream can fill and drop draws. Only when streams cannot grow
+    // (RX_VK_STREAM_GROW_OFF=1): a growing recording moves to a bigger stream instead, PR 585)
+    return stream_grow_off() && cur && cur->used > cur->size / 2;
 }
 bool mesh_args_ready();             // (below: the task programs' firsts)
 extern uint64_t mesh_args_address;
