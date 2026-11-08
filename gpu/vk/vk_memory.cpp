@@ -807,7 +807,11 @@ inline void cap_entry_set(uint64_t page, CapEntry e) {
     cap_table[c][page % kCapChunkPages] = e;
 }
 // (each kept capture's copy on the GPU, by its generation)
-struct CapBuf { uint64_t value; VkBuffer buffer; VmaAllocation alloc; uint64_t size; void* map; uint64_t last_use = 0; };
+struct CapBuf {
+    uint64_t value; VkBuffer buffer; VmaAllocation alloc; uint64_t size; void* map; uint64_t last_use = 0;
+    bool holdover = false;                 // (made at a capture's retirement from its still-current pages: cap_buf_retire_holding)
+    std::vector<uint32_t> pages, slots;    // (the pages it holds, and where each is in the buffer)
+};
 std::map<uint32_t, CapBuf> cap_bufs;
 uint64_t cap_bytes = 0;
 constexpr size_t kKeep = 24;
@@ -871,6 +875,76 @@ bool cap_buf_get(uint64_t need, VkBuffer& buffer, VmaAllocation& alloc, void*& m
     map = nullptr;
     return create_buffer_cached(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, buffer, alloc, &map,
                                 size >= (16ull << 20) && !getenv("RX_VK_CAP_BLOCKS")) && map;
+}
+// (hookshot) A capture past kKeep (24 submissions, ~4 frames) is retired, but a page of it that nothing wrote since, in a pool
+// whose mirror has not synced since, is the only copy of what guest memory held at its submit: the sync then read guest memory
+// as it was at the replay, the game's later frame (the "from guest memory" count of the 600-submit line, and the double-buffer
+// flashes an async replay showed). Those pages move into a holdover buffer kept under the capture's generation, up to
+// kHoldBytesMax in all; past that the oldest holdover goes and the sync reads live, as before. RX_VK_CAP_HOLDOVER=0: as before
+constexpr uint64_t kHoldBytesMax = 256ull << 20;
+uint64_t hold_bytes = 0;
+int64_t st_hold_pages = 0, st_hold_bufs = 0, st_hold_dropped = 0;
+bool cap_holdover_on() {
+    static const bool v = !getenv("RX_VK_CAP_HOLDOVER") || atoi(getenv("RX_VK_CAP_HOLDOVER")) != 0;
+    return v;
+}
+void hold_retire(std::map<uint32_t, CapBuf>::iterator it) {   // (a holdover: its bytes are hold_bytes, not cap_bytes)
+    hold_bytes -= it->second.size;
+    cap_buf_free(it->second.buffer, it->second.alloc, it->second.map, it->second.size);
+    cap_bufs.erase(it);
+}
+/// The capture at it retired, its still-current pages held over first (pools_mu held; the GPU is past the capture)
+void cap_buf_retire_holding(std::map<uint32_t, CapBuf>::iterator it, uint64_t completed) {
+    const uint32_t g = it->first;
+    CapBuf& b = it->second;
+    std::vector<uint32_t> keep, from;
+    if (cap_holdover_on() && !b.holdover && b.map) {
+        for (size_t i = 0; i < b.pages.size(); i++) {
+            const uint32_t p = b.pages[i];
+            const CapEntry e = cap_entry(p);
+            if (e.gen != g || e.slot != b.slots[i] || page_gen(p) != g) continue;   // (written since, or another capture's copy)
+            const uint64_t a = (uint64_t)p << 12;
+            auto pit = imported.upper_bound(a);
+            if (pit != imported.begin()) {
+                --pit;
+                if (a < pit->second.hi && pit->second.mstate == Pool::MIRROR_ON && pit->second.synced_gen >= g) continue;   // (the mirror has it)
+            }
+            keep.push_back(p), from.push_back(b.slots[i]);
+        }
+    }
+    if (!keep.empty()) {
+        const uint64_t need = (uint64_t)keep.size() * 4096;
+        // (room: the oldest holdovers the GPU is past go first)
+        while (hold_bytes + need > kHoldBytesMax) {
+            auto oldest = cap_bufs.end();
+            for (auto h = cap_bufs.begin(); h != cap_bufs.end() && oldest == cap_bufs.end(); ++h)
+                if (h->second.holdover && h != it && std::max(h->second.value, h->second.last_use) <= completed) oldest = h;
+            if (oldest == cap_bufs.end()) break;
+            hold_retire(oldest);
+        }
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VmaAllocation alloc = nullptr;
+        void* map = nullptr;
+        uint64_t size = 0;
+        if (hold_bytes + need <= kHoldBytesMax && cap_buf_get(need, buffer, alloc, map, size)) {
+            for (size_t k = 0; k < keep.size(); k++) {
+                std::memcpy((uint8_t*)map + k * 4096, (const uint8_t*)b.map + (uint64_t)from[k] * 4096, 4096);
+                cap_entry_set(keep[k], CapEntry{g, (uint32_t)k});
+            }
+            CapBuf h{b.value, buffer, alloc, size, map, b.last_use};
+            h.holdover = true;
+            h.pages = std::move(keep);
+            h.slots.resize(h.pages.size());
+            for (size_t k = 0; k < h.slots.size(); k++) h.slots[k] = (uint32_t)k;
+            st_hold_bufs++, st_hold_pages += (int64_t)h.pages.size();
+            cap_buf_retire(it);
+            hold_bytes += size;
+            cap_bufs.emplace(g, std::move(h));
+            return;
+        }
+        st_hold_dropped += (int64_t)keep.size();
+    }
+    cap_buf_retire(it);
 }
 std::vector<std::pair<uint64_t, uint64_t>> cap_ranges;   // (the mirrored pools the captures take, as of the last one)
 std::mutex cap_ranges_mu;
@@ -1508,11 +1582,17 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
     cur_cap_value = value;
     cur_cap_gen = 0;
     // (captures past the last kKeep, or past the byte budget, retired once the work that read them is done)
-    while (!cap_bufs.empty()) {
-        auto oldest = cap_bufs.begin();
-        const bool over = cap_bufs.size() > kKeep || cap_bytes > kCapBytesMax;
-        if (!over || std::max(oldest->second.value, oldest->second.last_use) > completed) break;
-        cap_buf_retire(oldest);
+    for (;;) {   // (the captures, holdovers aside: past kKeep or the byte budget, oldest first, once the GPU is past them)
+        size_t n = 0;
+        auto oldest = cap_bufs.end();
+        for (auto it = cap_bufs.begin(); it != cap_bufs.end(); ++it)
+            if (!it->second.holdover) {
+                n++;
+                if (oldest == cap_bufs.end()) oldest = it;
+            }
+        const bool over = n > kKeep || cap_bytes > kCapBytesMax;
+        if (oldest == cap_bufs.end() || !over || std::max(oldest->second.value, oldest->second.last_use) > completed) break;
+        cap_buf_retire_holding(oldest, completed);
     }
     uint32_t g = 0;
     if (!c->pages.empty()) {
@@ -1568,8 +1648,9 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
     const auto tk1 = std::chrono::steady_clock::now();
     if (!c->copied.empty() && g && c->map) {   // (its buffer kept with the captures, for the mirror syncs)
         CapBuf b{value, c->buffer, c->alloc, c->bsize, c->map};
+        b.pages = c->copied, b.slots = c->slots;   // (for the holdover at its retirement)
         c->buffer = VK_NULL_HANDLE, c->alloc = nullptr, c->map = nullptr, c->bsize = 0;
-        cap_bufs.emplace(g, b);
+        cap_bufs.emplace(g, std::move(b));
         cap_bytes += b.size;
         cur_cap_gen = g;
         for (size_t i = 0; i < c->copied.size(); i++) cap_entry_set(c->copied[i], CapEntry{g, c->slots[i]});
@@ -1587,9 +1668,11 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
         st_tk_all += std::chrono::duration<double, std::milli>(tk2 - tk0).count();
         if (++n % 600 == 0) {
             logf("vk: a capture taken (ms): all %.3f; retires and stamps %.3f, bytes copied %.3f; %zu kept (%llu MB), %zu "
-                 "spare buffers, %zu texture pages copied (%llu MB)", st_tk_all / 600, st_tk_stamp / 600, st_tk_copy / 600, cap_bufs.size(),
+                 "spare buffers, %zu texture pages copied (%llu MB); held over %lld pages in %lld buffers so far (%llu MB now, %lld pages not held)",
+                 st_tk_all / 600, st_tk_stamp / 600, st_tk_copy / 600, cap_bufs.size(),
                  (unsigned long long)(cap_bytes >> 20), cap_free.size(), shadow_n.load(std::memory_order_relaxed),
-                 (unsigned long long)(shadow_n.load(std::memory_order_relaxed) >> 8));
+                 (unsigned long long)(shadow_n.load(std::memory_order_relaxed) >> 8), (long long)st_hold_pages, (long long)st_hold_bufs,
+                 (unsigned long long)(hold_bytes >> 20), (long long)st_hold_dropped);
             st_tk_all = st_tk_stamp = st_tk_copy = 0;
         }
     }
