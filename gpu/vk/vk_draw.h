@@ -34,6 +34,8 @@ struct DrawArgs {
 void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value);
 /// The recording's stream still holds [at, at + n) in the mapping at base (a reset starts used over)
 bool stream_holds(const uint8_t* base, uint64_t at, uint64_t n);
+/// The recording's stream is more than half used (vk_replay.cpp maybe_split ends the part before it can fill)
+bool stream_crowded();
 /// The open render pass ends (before transfers, clears, barriers and the recording's end)
 void end_pass(VkCommandBuffer cmd);
 void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d);

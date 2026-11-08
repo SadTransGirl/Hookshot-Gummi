@@ -2176,6 +2176,9 @@ void descriptors_disturbed() {
 bool stream_holds(const uint8_t* base, uint64_t at, uint64_t n) {
     return cur && cur->mapped == base && n && at + n >= at && at + n <= cur->used;
 }
+bool stream_crowded() {
+    return cur && cur->used > kStream / 2;   // (vk_replay.cpp maybe_split: the part ends before its stream can fill)
+}
 bool mesh_args_ready();             // (below: the task programs' firsts)
 extern uint64_t mesh_args_address;
 namespace {
