@@ -257,6 +257,145 @@ void gpu_time_end(Recording& r) {
     ts_pending[r.slot] = true;
 }
 
+
+// ---- (hookshot) occlusion queries: real SAMPLES_PASSED counts (RX_VK_OCC_QUERIES=1) ----
+// Every samples-passed report read a fixed 4096 (occ_fixed, NOP_REPORT_COUNTER): the game saw every object it tested as
+// visible and drew it, so nothing was ever culled. With RX_VK_OCC_QUERIES=1 the draws between a reset and its report run
+// inside a Vulkan occlusion query, and the report's counter word is written on the GPU timeline from the query
+// (vkCmdCopyQueryPoolResults into the imported pool: guest memory), so the game's read after its fence sees what the GPU
+// counted, as on the console. The CPU still writes the 4096 at the report as before, so a read before the GPU's copy lands
+// sees "visible", never garbage, and the TIMESTAMP word beside it stays CPU-written (the clear flags and conditions are as
+// before: they read the words on the CPU). A span is counted on the GPU only when it is whole: its draws in one pass of one
+// part (one query piece), no draw skipped (a proxy not drawn would count 0: its object gone for a frame), no other queue's
+// draw inside it, a query left in the pool; otherwise it takes the 4096 as before, by reason in the frame log. A span with
+// no draw at all writes 0, as the console would. RX_VK_OCC_PRECISE=0: zero/non-zero counts only (precise is free here).
+int par_threads();
+constexpr uint32_t kOccPerSlot = 1024;
+VkQueryPool occ_pool = VK_NULL_HANDLE;
+bool occ_pool_failed = false;
+int occ_slot = -1;        // (the recording being made: its range of the pool)
+uint32_t occ_used = 0;    // (queries of that range used)
+enum { OCC_SKIPPED = 1, OCC_PIECES = 2, OCC_INTERLEAVED = 4, OCC_POOL_FULL = 8, OCC_NO_BUFFER = 16 };
+struct OccSpan {
+    bool open = false;
+    const void* state = nullptr;   // (the queue it is on)
+    int32_t query = -1;            // (the active query, or -1)
+    int32_t last_query = -1;       // (its one piece, once ended)
+    int pieces = 0, seen = 0, bad = 0;
+};
+OccSpan occ;
+struct OccResolve { uint32_t query; BufferRef dst; };
+std::vector<OccResolve> occ_pending;   // (the copies to record once outside the pass)
+int64_t st_occ_spans, st_occ_gpu, st_occ_zero, st_occ_queries, st_occ_est[5];
+bool occ_on() {
+    static const bool on = getenv("RX_VK_OCC_QUERIES") && atoi(getenv("RX_VK_OCC_QUERIES")) != 0 && par_threads() <= 1;
+    return on;
+}
+/// A recording begun: its range of the pool reset (outside any pass)
+void occ_begin_recording(Recording& r) {
+    if (!occ_on()) return;
+    if (!occ_pool && !occ_pool_failed) {
+        VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qi.queryType = VK_QUERY_TYPE_OCCLUSION;
+        qi.queryCount = kOccPerSlot * kRecordings;
+        if (vkCreateQueryPool(dev.device, &qi, nullptr, &occ_pool) != VK_SUCCESS) occ_pool = VK_NULL_HANDLE, occ_pool_failed = true;
+        logf("vk: occlusion queries %s (%u a recording%s)", occ_pool ? "on: the samples-passed reports count what the GPU drew" : "unavailable (no query pool)",
+             kOccPerSlot, dev.features.occlusionQueryPrecise ? ", precise" : ", not precise");
+    }
+    if (!occ_pool) return;
+    vkCmdResetQueryPool(r.cmd, occ_pool, (uint32_t)r.slot * kOccPerSlot, kOccPerSlot);
+    occ_slot = r.slot, occ_used = 0;
+}
+void occ_emit(VkCommandBuffer cmd) {   // (outside any pass)
+    for (const OccResolve& p : occ_pending)
+        vkCmdCopyQueryPoolResults(cmd, occ_pool, p.query, 1, p.dst.buffer, p.dst.offset, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    occ_pending.clear();
+}
+void occ_end_query(VkCommandBuffer cmd) {
+    if (occ.query < 0) return;
+    vkCmdEndQuery(cmd, occ_pool, (uint32_t)occ.query);
+    occ.last_query = occ.query, occ.query = -1;
+}
+void occ_pass_ending(VkCommandBuffer cmd) {
+    if (occ_pool) occ_end_query(cmd);
+}
+void occ_pass_ended(VkCommandBuffer cmd) {
+    if (occ_pool && !occ_pending.empty()) occ_emit(cmd);
+}
+void occ_draw_hook(VkCommandBuffer cmd, const void* state) {   // (draw(): inside the pass, before the draw call)
+    if (!occ_pool || !occ.open) return;
+    if (occ.state != state) {   // (another queue's draw while this span's query is active: counted into it)
+        if (occ.query >= 0) occ.bad |= OCC_INTERLEAVED;
+        return;
+    }
+    if (occ.query >= 0) return;
+    if (!pass_open()) return;   // (a query begun outside a pass could not end inside one: the next draw's, then)
+    if (occ_slot < 0 || occ_used >= kOccPerSlot) {
+        occ.bad |= OCC_POOL_FULL;
+        return;
+    }
+    const uint32_t q = (uint32_t)occ_slot * kOccPerSlot + occ_used++;
+    static const bool precise = dev.features.occlusionQueryPrecise && !(getenv("RX_VK_OCC_PRECISE") && atoi(getenv("RX_VK_OCC_PRECISE")) == 0);
+    vkCmdBeginQuery(cmd, occ_pool, q, precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+    occ.query = (int32_t)q;
+    occ.pieces++;
+    st_occ_queries++;
+}
+/// NOP_RESET_COUNTER of SAMPLES_PASSED: a span begins (one without its report is dropped)
+void occ_reset(VkCommandBuffer cmd, const NvnState& s) {
+    if (!occ_pool) return;
+    occ_end_query(cmd);
+    occ = OccSpan{};
+    occ.open = true, occ.state = &s;
+}
+/// A draw of the stream: the span sees it, and one that did not happen (skipped in draw()) spoils the span
+void occ_draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& da) {
+    if (!occ_pool || !occ.open || occ.state != &s) return draw(cmd, s, da);
+    int64_t d0, d1, x;
+    draw_stats(&d0, &x, &x, &x);
+    draw(cmd, s, da);
+    draw_stats(&d1, &x, &x, &x);
+    occ.seen++;
+    if (d1 == d0) occ.bad |= OCC_SKIPPED;
+}
+/// NOP_REPORT_COUNTER of SAMPLES_PASSED: value is what the CPU writes now; the GPU's copy is queued when the span is whole
+void occ_report(VkCommandBuffer cmd, const NvnState& s, uint64_t addr, uint64_t& value) {
+    if (!occ_pool || !occ.open || occ.state != &s) return;
+    occ_end_query(cmd);
+    occ.open = false;
+    st_occ_spans++;
+    if (occ.seen == 0) {
+        value = 0;
+        st_occ_zero++;
+        return;
+    }
+    if (occ.pieces != 1 || occ.last_query < 0) occ.bad |= OCC_PIECES;
+    BufferRef dst;
+    if (!occ.bad) {
+        dst = gpu_buffer(addr, 8);
+        if (!dst || (dst.offset & 7)) occ.bad |= OCC_NO_BUFFER;   // (a 64-bit copy wants an 8-byte offset)
+    }
+    if (occ.bad) {
+        for (int i = 0; i < 5; i++)
+            if (occ.bad & (1 << i)) st_occ_est[i]++;
+        return;
+    }
+    occ_pending.push_back({(uint32_t)occ.last_query, dst});
+    if (!pass_open()) occ_emit(cmd);
+    st_occ_gpu++;
+}
+void occ_log(double frames) {
+    if (!occ_pool) return;
+    static int64_t l_sp, l_gpu, l_zero, l_q, l_est[5];
+    logf("vk: occlusion: a frame: %.1f spans, %.1f counted on the GPU, %.1f with no draw (0), %.1f queries; as 4096: %.1f with a draw "
+         "skipped, %.1f over a pass or part end, %.1f interleaved, %.1f pool full, %.1f no buffer",
+         (st_occ_spans - l_sp) / frames, (st_occ_gpu - l_gpu) / frames, (st_occ_zero - l_zero) / frames, (st_occ_queries - l_q) / frames,
+         (st_occ_est[0] - l_est[0]) / frames, (st_occ_est[1] - l_est[1]) / frames, (st_occ_est[2] - l_est[2]) / frames,
+         (st_occ_est[3] - l_est[3]) / frames, (st_occ_est[4] - l_est[4]) / frames);
+    l_sp = st_occ_spans, l_gpu = st_occ_gpu, l_zero = st_occ_zero, l_q = st_occ_queries;
+    for (int i = 0; i < 5; i++) l_est[i] = st_occ_est[i];
+}
+
 /// The next recording slot, begun, for the submission that will signal value
 Recording& begin_recording(uint64_t value) {
     Recording& r = recordings[recording_index];
@@ -276,6 +415,7 @@ Recording& begin_recording(uint64_t value) {
     vkBeginCommandBuffer(r.cmd, &bi);
     vkBeginCommandBuffer(r.upload, &bi);
     gpu_time_begin(r);
+    occ_begin_recording(r);
     gprof_begin_recording(r.slot, r.cmd, r.upload);
     r.value = value;
     memory_recording_value(value, completed());
@@ -772,7 +912,9 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             // ground and the haze brightened over the whole picture (one-frame flicker, most of it at load-in; 30-52 per 2,700
             // frames in Kokiri, 4-6 with this, RX 7900 GRE). RX_VK_OCC_FIXED=<n>: that value; -1: the per-draw count as before
             static const int64_t occ_fixed = getenv("RX_VK_OCC_FIXED") ? atoll(getenv("RX_VK_OCC_FIXED")) : 4096;
-            const uint64_t rec[2] = {samples ? (occ_fixed >= 0 ? (uint64_t)occ_fixed : s.samples_passed) : 0, ns * 12 / 625};
+            uint64_t rec[2] = {samples ? (occ_fixed >= 0 ? (uint64_t)occ_fixed : s.samples_passed) : 0, ns * 12 / 625};
+            // (hookshot) RX_VK_OCC_QUERIES=1: the real count follows on the GPU timeline (occ_report); rec[0] is the CPU's now
+            if (samples && !dry) occ_report(cmd, s, c.addr, rec[0]);
             if (dump_on())
                 logf("vk: dump-op %03d REPORT_COUNTER type %d at %#llx: %llu", dump_seq(), (int)c.type,
                      (unsigned long long)c.addr, (unsigned long long)rec[0]);
@@ -788,7 +930,10 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
         }
         case NOP_RESET_COUNTER: {
             const auto c = payload<nvn_p_counter>(a, avail);
-            if (c.type == NVN_COUNTER_TYPE_SAMPLES_PASSED) s.samples_passed = 0;
+            if (c.type == NVN_COUNTER_TYPE_SAMPLES_PASSED) {
+                s.samples_passed = 0;
+                if (!dry && !worker) occ_reset(cmd, s);   // (hookshot: an occlusion span begins)
+            }
             break;
         }
         case NOP_COPY_B2B: {
@@ -1148,7 +1293,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 DrawArgs da;
                 da.prim = d.prim, da.first = d.first, da.count = d.count;
                 da.base_instance = d.base_instance, da.instances = d.instances;
-                draw(cmd, s, da);
+                occ_draw(cmd, s, da);   // (hookshot: inside an occlusion span, counted)
             }
             s.samples_passed += 16;
             break;
@@ -1160,7 +1305,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 da.prim = d.prim, da.indexed = true, da.itype = d.itype, da.count = d.count;
                 da.base_vertex = d.base_vertex, da.base_instance = d.base_instance, da.instances = d.instances;
                 da.ibuf = d.ibuf;
-                draw(cmd, s, da);
+                occ_draw(cmd, s, da);   // (hookshot: inside an occlusion span, counted)
             }
             s.samples_passed += 16;
             break;
@@ -1172,7 +1317,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 da.prim = d.prim, da.indexed = d.indexed != 0, da.itype = d.itype;
                 da.indirect = d.indirect, da.count_addr = d.count_addr, da.max = d.max, da.stride = d.stride;
                 da.ibuf = d.ibuf;
-                draw(cmd, s, da);
+                occ_draw(cmd, s, da);   // (hookshot: inside an occlusion span, counted)
             }
             s.samples_passed += 16;
             break;
@@ -1191,7 +1336,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 da.groups[0] = d.y, da.groups[1] = 1, da.groups[2] = 1;
                 if (d.kind == 0) da.first_task = d.x;   // (hookshot: the task programs add it, vk_draw.cpp's mesh_args)
                 da.indirect = d.indirect, da.count_addr = d.count_addr, da.max = d.max, da.stride = d.stride;
-                draw(cmd, s, da);
+                occ_draw(cmd, s, da);   // (hookshot: inside an occlusion span, counted)
             }
             s.samples_passed += 16;
             break;
@@ -2466,6 +2611,7 @@ void log_frame_stats() {
              (st_ub_overlays - l_ubo) / 120.0, (st_wait_ns - l_wait) / 120.0 / 1e6, (long long)pl, pms,
              (long long)tr, (long long)fl, texture_count(), (unsigned long long)(texture_bytes() >> 20));
         draw_skip_report(120.0);
+        occ_log(120.0);
         {   // (hookshot: the full barriers recorded and the ones left out as the second of two in a row, RX_VK_BARRIER_DEDUPE_OFF=1)
             static int64_t l_made, l_left;
             int64_t made = 0, left = 0;

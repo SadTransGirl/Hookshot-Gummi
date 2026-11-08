@@ -88,6 +88,11 @@ bool memory_table_flush();
 uint64_t memory_guest_pages();                        // (hookshot: the device address of guest memory's page table, 0: none)
 void memory_sync();                                   // (at each submit: pools the game made or let go)
 BufferRef gpu_buffer(uint64_t gpu, uint64_t size);   // (empty when no pool holds the range)
+// (hookshot) occlusion queries (vk_replay.cpp): a span's query begins at its first draw, inside the pass (draw()); a pass
+// end ends the active one and records the finished spans' result copies, outside the pass
+void occ_draw_hook(VkCommandBuffer cmd, const void* state);
+void occ_pass_ending(VkCommandBuffer cmd);
+void occ_pass_ended(VkCommandBuffer cmd);
 /// A range as a binding of the replay sees it: the pool's VRAM mirror when it has one (vk_memory.cpp), else the
 /// imported pool. written: the GPU may write it (copied back to guest memory at the submission's end).
 BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written);

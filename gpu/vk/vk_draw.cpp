@@ -3856,10 +3856,15 @@ void probe_log(uint64_t f) {
 // (amd-fix, diagnosis) in a frame dump, the indirect mesh draws' arguments as the GPU has them: noted at the draw (inside
 // the pass, where no copy can be recorded) and copied out once the pass ends ("dump buffer ... mesh indirect")
 thread_local std::vector<std::pair<uint64_t, uint64_t>> dump_mesh_indirect;   // (program key, indirect address)
+bool pass_open() {
+    return pass.open;
+}
 void end_pass(VkCommandBuffer cmd) {
     if (!pass.open) return;
+    occ_pass_ending(cmd);   // (hookshot: an occlusion query active in the pass ends with it)
     vkCmdEndRendering(cmd);
     pass.open = false;
+    occ_pass_ended(cmd);    // (and the finished spans' counts are copied out, outside the pass)
     if (dump_on() && !dump_mesh_indirect.empty()) {
         for (const auto& [key, addr] : dump_mesh_indirect) {
             const BufferRef r = gpu_buffer_bind(addr, 16, false);
@@ -5140,6 +5145,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         }
     }
     StatsQuery stats_query(cmd, p.key, d);   // (EvilOOT, RX_VK_DRAW_STATS)
+    occ_draw_hook(cmd, &s);   // (hookshot: an occlusion span's query begins at its first draw, inside the pass)
     if (stats_frame_now() && stats_prog_wanted(p.key)) {   // (and the wanted programs' buffers: a mesh draw's stages, fragment)
         for (const int stage : {6, 7, 1}) stats_dump_stage(p.key, s, stage);
         // (and as the GPU holds them, after it: RX_VK_GPU_DUMP=1 only; its bindings can sync a pool's mirror mid-frame, and
