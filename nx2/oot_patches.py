@@ -65,6 +65,38 @@ def patch_text_speed(s):
     return s.replace('#include "a64.h"\n', '#include "a64.h"\n' + TEXT_DECL, 1)
 
 
+SCENE_ENTRY = "void f_831f3200(Ctx *__restrict A64_NOESC c) {"
+SCENE_SCALE_FIX = """
+    // (nx2/oot_patches.py, PR 329) Fixed-resolution scale invalidation (experimental opt-in: HOS_FIX_RES=1).
+    // The fixed controller result can request a resource refresh without
+    // marking the cached scene scale dirty, leaving the last dynamic scale.
+    if (hos_fixed_resolution && getenv("HOS_FIX_RES") && atoi(getenv("HOS_FIX_RES")) != 0) {
+        float requested, base, reference, previous;
+        uint32_t u=hos_fixed_scale_bits; memcpy(&requested,&u,4);
+        u=recomp_load32(c,c->x[0]+3664); memcpy(&base,&u,4);
+        u=recomp_load32(c,c->x[0]+3672); memcpy(&reference,&u,4);
+        u=recomp_load32(c,c->x[0]+3676); memcpy(&previous,&u,4);
+        if (base > 0.0f && reference > 0.0f && requested > 0.0f && requested <= 2.0f &&
+            previous != requested * reference / base) {
+            uint32_t dirty=recomp_load32(c,c->x[0]+3628);
+            recomp_store32(c,c->x[0]+3628,dirty|8u);
+        }
+    }
+"""
+
+
+def apply_scene_scale_fix(source):
+    if SCENE_SCALE_FIX in source:
+        return source
+    if source.count(SCENE_ENTRY) != 1:
+        raise ValueError("Expected exactly one scene-resolution function")
+    header = '#include "a64.h"\n'
+    if source.count(header) != 1:
+        raise ValueError("Expected exactly one guest header")
+    source = source.replace(header, header + '#include <stdlib.h>\n' + DECL, 1)
+    return source.replace(SCENE_ENTRY, SCENE_ENTRY + SCENE_SCALE_FIX, 1)
+
+
 def apply(gen):
     import oot_native_resolution
     oot_native_resolution.apply(gen)
@@ -89,6 +121,20 @@ def apply(gen):
     for what, n in done.items():
         if n != 1:
             print("oot_patches: WARNING: the %s was found %d times" % (what, n))
+    scenes = 0   # (PR 329: the fixed scale's refresh, HOS_FIX_RES=1 at run time; another game version leaves it out)
+    for path in sorted(glob.glob(os.path.join(gen, "code_*.c"))):
+        with open(path, encoding="utf-8", newline="") as f:
+            source = f.read()
+        if SCENE_ENTRY not in source:
+            continue
+        updated = apply_scene_scale_fix(source)
+        if updated != source:
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write(updated)
+            print("oot_patches: fixed-scale refresh (HOS_FIX_RES) in", os.path.basename(path))
+        scenes += 1
+    if scenes != 1:
+        print("oot_patches: WARNING: the scene-resolution function was found %d times" % scenes)
 
 
 if __name__ == "__main__":
