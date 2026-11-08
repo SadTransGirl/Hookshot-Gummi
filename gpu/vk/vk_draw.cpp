@@ -4937,15 +4937,18 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     // when none changed since the last draw, the set it pushed or bound stands)
     const uint64_t reg_gen = registrations_generation(), ub_gen = ub_generation();
     static const bool no_reuse = getenv("RX_VK_NO_DESC_REUSE") != nullptr;   // (A/B: every draw builds its own)
+    // (PR 435's kept sets, pushed again when a program returns after another: off unless RX_VK_DESC_REUSE=1. In OoT 53 of 2,750
+    // draws a frame came back to a program with the same bindings, and the bookkeeping cost ~2 ms a frame)
+    static const bool keep_sets = getenv("RX_VK_DESC_REUSE") && atoi(getenv("RX_VK_DESC_REUSE")) != 0;
     const bool same_desc = !no_reuse && last_desc_valid && last_desc_prog == &p && last_desc_bind == s.bind_gen &&
                            last_desc_reg == reg_gen && last_desc_ub == ub_gen;
     if (!same_desc) {
         trace_tex_hit = nullptr, trace_tex_mask = 0;
         const bool quiet = dump_on() || probe_on() || stats_frame_now();
-        if (no_reuse || quiet || !desc_prog_use(p, s, reg_gen)) {
+        if (no_reuse || quiet || !keep_sets || !desc_prog_use(p, s, reg_gen)) {
             PROF(PROF_DESC);
             FINE_N(FC_BUILDS, 1);
-            desc_prog_build(p, s, reg_gen, !no_reuse && !quiet);   // (textures first used here are uploaded by the recording's upload command buffer)
+            desc_prog_build(p, s, reg_gen, keep_sets && !no_reuse && !quiet);   // (textures first used here are uploaded by the recording's upload command buffer)
             FINE_N(FC_WRITES, (int64_t)dw.writes.size());
             static std::string last_logged;
             if (dump_on()) {
@@ -6585,12 +6588,13 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
     {
         const uint64_t reg_gen = registrations_generation();
         static const bool no_reuse = getenv("RX_VK_NO_DESC_REUSE") != nullptr;
+        static const bool keep_sets = getenv("RX_VK_DESC_REUSE") && atoi(getenv("RX_VK_DESC_REUSE")) != 0;   // (PR 435's kept sets: see draw())
         static const bool no_grid_patch = getenv("RX_VK_NO_GRID_PATCH") != nullptr;
         const bool quiet = dump_on() || probe_on() || stats_frame_now();
         // (an indirect dispatch's grid is patched into its c0 copy as the descriptors are built (grid_patch_at): built each time)
         grid_patch_want = indirect && !no_grid_patch, grid_patch_at = UINT64_MAX;
-        if (no_reuse || quiet || grid_patch_want || !desc_prog_use(p, s, reg_gen))
-            desc_prog_build(p, s, reg_gen, !no_reuse && !quiet && !grid_patch_want);
+        if (no_reuse || quiet || !keep_sets || grid_patch_want || !desc_prog_use(p, s, reg_gen))
+            desc_prog_build(p, s, reg_gen, keep_sets && !no_reuse && !quiet && !grid_patch_want);
         grid_patch_want = false;
     }
     dclock.t_desc = slow_dispatch_timing() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
