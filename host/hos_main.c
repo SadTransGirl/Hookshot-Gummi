@@ -379,6 +379,7 @@ float hos_aspect_ratio = 0;   /* (the window's default shape: host/display.c) */
 /* (nx2/oot_wide.py) read by the widescreen patches in the game's code; 0: the game's own 16:9 */
 volatile uint64_t hos_wide_out, hos_wide_scene;
 volatile float hos_wide_ratio, hos_wide_squeeze, hos_wide_margin;
+volatile int hos_native_scene;   /* nx2/oot_native_resolution.py: opt-in base render scale */
 /* (nx2/oot_occlusion.py) read by the game's code where it decides to make occlusion queries: 1, none (HOOKSHOT_OCCLUSION_OFF=1) */
 volatile int hos_occlusion_off;
 static void occlusion_switch(void) {
@@ -555,6 +556,15 @@ static int game_main(int argc, char **argv) {
                     (double)hos_wide_ratio, hos_wide_squeeze * 100.0);
         } else if (want > 1.0f) {
             hos_log("boot: widescreen: a %.4f screen is not wider than 16:9: the game's own picture", (double)want);
+        }
+        /* Changing the initial scene-size constant is insufficient: the engine's
+           active mode separately multiplies its base dimensions by 0.8. The
+           lifted configuration-update hook overrides that factor and lets the
+           original resource-change notifications propagate before rendering. */
+        const char *native_scene = getenv("HOS_SCENE_NATIVE");
+        if (native_scene && atoi(native_scene) == 1) {
+            hos_native_scene = 1;
+            hos_log("boot: native base render scale requested (HOS_SCENE_NATIVE); verify actual color/depth in the renderer");
         }
     }
     hos_log("boot: image %zu MB at %#llx, %llu MB of memory for the game", n >> 20, IMAGE_BASE,
