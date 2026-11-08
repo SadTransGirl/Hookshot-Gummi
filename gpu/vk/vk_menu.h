@@ -30,6 +30,9 @@ struct Options {
     int preset = 0;       // quality preset: 0 Custom, 1 Minimum (4GB), 2 Low (6GB), 3 Balanced (8GB), 4 High (12GB), 5 Ultra (16GB+)
     int vram_mb = 0;      // dynamic texture cache budget limit in MB
     int mirror_mb = 0;    // staging mirror limit in MB
+    int motion = 0;       // motion aiming from the pad's gyroscope (host/nn_hid.c, the six-axis states): 0 off, 1 on
+    int motion_sens = 100;// its sensitivity in percent
+    int motion_invert = 0;// its vertical swapped
 };
 extern Options opts;
 /// (vk_memory.cpp) true when the quality preset's memory budgets (vram_mb, mirror_mb) are to be used: the card has no more

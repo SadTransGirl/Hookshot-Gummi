@@ -24,11 +24,13 @@ enum { BTN_A, BTN_B, BTN_X, BTN_Y, BTN_BACK, BTN_GUIDE, BTN_START, BTN_LSTICK, B
 enum { AX_LX, AX_LY, AX_RX, AX_RY, AX_LT, AX_RT };
 
 #define MAX_PADS 8
-static struct { void *gc; int32_t id; uint16_t rumble_lo, rumble_hi; int64_t rumble_ns; } pads[MAX_PADS];
+static struct { void *gc; int32_t id; uint16_t rumble_lo, rumble_hi; int64_t rumble_ns; int sensors; } pads[MAX_PADS];
 static SRWLOCK state_lock = SRWLOCK_INIT;
 static uint64_t state_buttons;
 static int32_t state_stick[4];
 static int state_count;
+static float state_accel[3], state_gyro[3];   /* (the first pad with sensors: SDL's m/s^2 and rad/s) */
+static int state_motion;
 static volatile LONG rumble_low, rumble_high;   /* 0..65535, set by the vibration HLE */
 
 static int32_t stick_value(int16_t v, int flip) {
@@ -48,6 +50,9 @@ static int pads_start(void) {
        Controller's A, on the right, at the bottom button's place: A acted as B and X as Y: SkyboundTotk issue 12. SDL3's
        are by position always) */
     hos_sdl_hint("SDL_GAMECONTROLLER_USE_BUTTON_LABELS", "0");
+    /* (hookshot) the Steam Controller through SDL's own HIDAPI driver, which SDL leaves off because Steam usually drives the pad:
+       with it the pad's buttons, pads and gyroscope reach the game without Steam Input. HOS_SDL_STEAM_HIDAPI=0: as SDL has it */
+    if (!getenv("HOS_SDL_STEAM_HIDAPI") || atoi(getenv("HOS_SDL_STEAM_HIDAPI")) != 0) hos_sdl_hint("SDL_JOYSTICK_HIDAPI_STEAM", "1");
     /* (with no window nothing reads SDL's quit event: SDL's own SIGINT/SIGTERM handlers turned a timeout's or a service
        manager's SIGTERM into that event, and the run went on until SIGKILL. Without them the signals end it as usual) */
     if (getenv("HOS_HEADLESS")) hos_sdl_hint("SDL_NO_SIGNAL_HANDLERS", "1");
@@ -81,6 +86,7 @@ static void pads_poll(void) {
                     pads[i].gc = NULL;
                     pads[i].rumble_lo = pads[i].rumble_hi = 0;
                     pads[i].rumble_ns = 0;
+                    pads[i].sensors = 0;
                 }
             int32_t ids[32];
             int opens[32];
@@ -99,12 +105,15 @@ static void pads_poll(void) {
                 pads[slot].id = hos_sdl_pad_id(gc);
                 pads[slot].rumble_lo = pads[slot].rumble_hi = 0;
                 pads[slot].rumble_ns = 0;
-                hos_log("hid: controller \"%s\" connected (SDL)", hos_sdl_pad_name(gc));
+                pads[slot].sensors = hos_sdl_pad_sensors_enable(gc);   /* (motion aiming, nn_hid.c: where the pad has a gyroscope) */
+                hos_log("hid: controller \"%s\" connected (SDL%s)", hos_sdl_pad_name(gc), pads[slot].sensors ? ", with motion sensors" : "");
             }
         }
         uint64_t b = 0;
         int32_t s[4] = {0};
         int count = 0;
+        float accel[3] = {0}, gyro[3] = {0};
+        int motion = 0;
         const uint16_t lo = (uint16_t)rumble_low, hi = (uint16_t)rumble_high;
         for (int i = 0; i < MAX_PADS; i++) {
             void *gc = pads[i].gc;
@@ -121,6 +130,7 @@ static void pads_poll(void) {
                                   stick_value(hos_sdl_pad_axis(gc, AX_RX), inv_x), stick_value(hos_sdl_pad_axis(gc, AX_RY), inv_y ? 0 : 1)};
             for (int k = 0; k < 4; k++)
                 if ((v[k] < 0 ? -v[k] : v[k]) > (s[k] < 0 ? -s[k] : s[k])) s[k] = v[k];
+            if (!motion && pads[i].sensors && hos_sdl_pad_sensors(gc, accel, gyro)) motion = 1;
             if (rumble_due(lo, hi, pads[i].rumble_lo, pads[i].rumble_hi, now, pads[i].rumble_ns)) {
                 hos_sdl_pad_rumble(gc, lo, hi, lo || hi ? 1000 : 0);
                 pads[i].rumble_lo = lo;
@@ -132,6 +142,9 @@ static void pads_poll(void) {
         state_buttons = b;
         memcpy(state_stick, s, sizeof s);
         state_count = count;
+        memcpy(state_accel, accel, sizeof accel);
+        memcpy(state_gyro, gyro, sizeof gyro);
+        state_motion = motion;
         ReleaseSRWLockExclusive(&state_lock);
 }
 
@@ -157,14 +170,14 @@ void hos_sdl_pads_pump(void) {
 }
 #endif
 
-/* The controllers' merged state (nn_hid.c): ORs their inputs in (1 << HOS_PAD_*), keeps the larger stick
-   deflections; returns how many controllers SDL has open. Starts the SDL thread on the first call. */
-int hos_sdl_pads(uint64_t *buttons, int32_t stick[4]) {
-    static volatile LONG started;
+/* The SDL thread (or, on Linux, the window's polling), started by the first call of hos_sdl_pads or hos_sdl_sensors; 0 when there
+   is no SDL */
+static int ensure_started(void) {
+    static volatile LONG started, absent;
     if (!started && !InterlockedExchange(&started, 1)) {
-        if (getenv("HOS_NO_SDL")) return 0;
-        if (!hos_sdl_load()) {
-            hos_log("hid: no SDL beside the exe or on the system: only XInput controllers (Xbox pads) work");
+        if (getenv("HOS_NO_SDL") || !hos_sdl_load()) {
+            if (!getenv("HOS_NO_SDL")) hos_log("hid: no SDL beside the exe or on the system: only XInput controllers (Xbox pads) work");
+            InterlockedExchange(&absent, 1);
             return 0;
         }
 #ifdef _WIN32
@@ -176,6 +189,13 @@ int hos_sdl_pads(uint64_t *buttons, int32_t stick[4]) {
             CreateThread(NULL, 0, pad_main, NULL, 0, NULL);   /* (no window: nothing else pumps SDL) */
 #endif
     }
+    return !absent;
+}
+
+/* The controllers' merged state (nn_hid.c): ORs their inputs in (1 << HOS_PAD_*), keeps the larger stick
+   deflections; returns how many controllers SDL has open. Starts the SDL thread on the first call. */
+int hos_sdl_pads(uint64_t *buttons, int32_t stick[4]) {
+    if (!ensure_started()) return 0;
     AcquireSRWLockShared(&state_lock);
     const int n = state_count;
     *buttons |= state_buttons;
@@ -184,6 +204,18 @@ int hos_sdl_pads(uint64_t *buttons, int32_t stick[4]) {
             stick[k] = state_stick[k];
     ReleaseSRWLockShared(&state_lock);
     return n;
+}
+
+/* (hookshot) The first pad with sensors' motion (nn_hid.c's six-axis states), in SDL's units and axes: acceleration m/s^2,
+   angular velocity rad/s, x right, y up, z toward the player. 0 while no such pad is open. */
+int hos_sdl_sensors(float accel[3], float gyro[3]) {
+    if (!ensure_started()) return 0;
+    AcquireSRWLockShared(&state_lock);
+    const int motion = state_motion;
+    memcpy(accel, state_accel, sizeof state_accel);
+    memcpy(gyro, state_gyro, sizeof state_gyro);
+    ReleaseSRWLockShared(&state_lock);
+    return motion;
 }
 
 /* Vibration from the game (0..1 amplitudes of the low and high bands), for the pads that rumble. */
