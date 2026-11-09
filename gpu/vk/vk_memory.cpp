@@ -2026,8 +2026,12 @@ void gpu_words_merge() {   // (holding cpu_words_mu)
     gpu_words.erase(std::unique(gpu_words.begin(), gpu_words.end()), gpu_words.end());
     gpu_words_new.clear();
 }
+bool occ_mirror_on() {
+    static const bool on = getenv("RX_VK_OCC_MIRROR") && atoi(getenv("RX_VK_OCC_MIRROR")) != 0;
+    return on;
+}
 void memory_gpu_owned(uint64_t guest, uint64_t size) {
-    if (!guest || !size) return;
+    if (!guest || !size || !occ_mirror_on()) return;
     std::lock_guard lk(cpu_words_mu);
     if (gpu_words.size() + gpu_words_new.size() > 65536) {
         gpu_words_merge();
@@ -2177,8 +2181,10 @@ void mirror_sync(Pool& p) {
         page++;
     }
     if (run_hi) runs.push_back({run_lo, run_lo, run_hi - run_lo});
-    for (auto& [buf, rs] : cap_runs) cut_gpu_words(p, rs);   // (hookshot: the counts the GPU wrote into the mirror stay)
-    cut_gpu_words(p, runs);
+    if (occ_mirror_on()) {   // (hookshot: the counts the GPU wrote into the mirror stay; RX_VK_OCC_MIRROR=1 only: see vk_internal.h)
+        for (auto& [buf, rs] : cap_runs) cut_gpu_words(p, rs);
+        cut_gpu_words(p, runs);
+    }
     for (const auto& [buf, rs] : cap_runs) {
         if (rs.empty()) continue;
         GprofSpan gp(upload_command_buffer(), "msync copies (CPU pages from a capture -> mirror)");
@@ -2269,7 +2275,7 @@ bool gpu_buffer_pair(uint64_t gpu, uint64_t size, BufferRef* guest, BufferRef* m
     if (p->last_value < mem_rec_value) p->last_value = mem_rec_value;
     const uint64_t off = g - p->lo;
     *guest = {p->buffer, off, size, p->address + off};
-    if (p->mstate == Pool::MIRROR_ON && p->mirror) *mirror = {p->mirror, off, size, 0};
+    if (occ_mirror_on() && p->mstate == Pool::MIRROR_ON && p->mirror) *mirror = {p->mirror, off, size, 0};
     *pool_lo = p->lo, *pool_size = p->hi - p->lo, *mstate = (int)p->mstate;
     return true;
 }

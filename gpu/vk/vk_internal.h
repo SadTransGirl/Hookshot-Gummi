@@ -92,6 +92,9 @@ BufferRef gpu_buffer(uint64_t gpu, uint64_t size);   // (empty when no pool hold
 bool gpu_buffer_pair(uint64_t gpu, uint64_t size, BufferRef* guest, BufferRef* mirror, uint64_t* pool_lo, uint64_t* pool_size, int* mstate);
 /// (hookshot) words the GPU writes in both copies (the occlusion counts): a mirror sync never copies guest memory over them
 void memory_gpu_owned(uint64_t guest, uint64_t size);
+/// (hookshot) RX_VK_OCC_MIRROR=1: the counts written into the mirrors too, and kept out of their syncs (the cut made every sync
+/// of the counter pool thousands of small copies: 500 -> 5,000-10,000 a frame, GPU time 18 -> 25-34 ms). Off by default
+bool occ_mirror_on();
 // (hookshot) occlusion queries (vk_replay.cpp): a span's query begins at its first draw, inside the pass (draw()); a pass
 // end ends the active one and records the finished spans' result copies, outside the pass
 void occ_draw_hook(VkCommandBuffer cmd, const void* state);

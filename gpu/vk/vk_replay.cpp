@@ -289,6 +289,18 @@ OccSpan occ;
 struct OccResolve { bool fill; uint32_t query; uint32_t value; BufferRef dst[2]; };   // (a query's copy, or a fill: guest memory and the mirror)
 std::vector<OccResolve> occ_pending;   // (the copies to record once outside the pass)
 int64_t st_occ_spans, st_occ_gpu, st_occ_zero, st_occ_queries, st_occ_est[5], st_occ_mirror;
+// (the render conditions: all of them, those on a word a samples-passed report wrote (addr or addr + 16), by mode, and off)
+int64_t st_cond_all, st_cond_queried[2], st_cond_off, st_cond_queried_off;
+std::unordered_set<uint64_t> occ_words;   // (the words the reports wrote, as the game's GPU addresses: bounded)
+void occ_cond(uint64_t addr, int mode, bool on) {
+    st_cond_all++;
+    if (!on) st_cond_off++;
+    if (occ_words.empty()) return;
+    if (occ_words.count(addr) || occ_words.count(addr + 16)) {
+        st_cond_queried[mode & 1]++;
+        if (!on) st_cond_queried_off++;
+    }
+}
 bool occ_on() {
     static const bool on = getenv("RX_VK_OCC_QUERIES") && atoi(getenv("RX_VK_OCC_QUERIES")) != 0 && par_threads() <= 1;
     return on;
@@ -400,6 +412,7 @@ void occ_report(VkCommandBuffer cmd, const NvnState& s, uint64_t addr, uint64_t&
         }
     }
     if (have) memory_gpu_owned(host->gpu_guest(addr), 8);
+    if (occ_words.size() < 65536) occ_words.insert(addr);
     bool whole = occ.seen > 0;
     if (occ.seen == 0) value = 0, st_occ_zero++;
     else {
@@ -433,6 +446,11 @@ void occ_log(double frames) {
          (st_occ_hist[0] - l_h[0]) / frames, (st_occ_hist[1] - l_h[1]) / frames, (st_occ_hist[2] - l_h[2]) / frames,
          (st_occ_hist[3] - l_h[3]) / frames, (st_occ_hist[4] - l_h[4]) / frames, (st_occ_hist[5] - l_h[5]) / frames);
     for (int i = 0; i < 6; i++) l_h[i] = st_occ_hist[i];
+    static int64_t l_ca, l_cq[2], l_co, l_cqo;
+    logf("vk: occlusion: render conditions a frame: %.1f, %.1f off; on a reported word: %.1f equal-mode, %.1f differ-mode, %.1f off",
+         (st_cond_all - l_ca) / frames, (st_cond_off - l_co) / frames, (st_cond_queried[0] - l_cq[0]) / frames,
+         (st_cond_queried[1] - l_cq[1]) / frames, (st_cond_queried_off - l_cqo) / frames);
+    l_ca = st_cond_all, l_co = st_cond_off, l_cq[0] = st_cond_queried[0], l_cq[1] = st_cond_queried[1], l_cqo = st_cond_queried_off;
 }
 
 /// The next recording slot, begun, for the submission that will signal value
@@ -1273,6 +1291,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 host->gpu_read(r.addr + 16, &y, 8);
             }
             s.render_enabled = r.mode == 0 ? x == y : x != y;
+            if (occ_pool) occ_cond(r.addr, (int)r.mode, s.render_enabled);   // (hookshot: counted for the occlusion log)
             {   // (RX_VK_COND_ALWAYS=1 (test): every condition holds. The frame log's dark frames dump the last ones)
                 static const bool always = getenv("RX_VK_COND_ALWAYS") != nullptr;
                 const uint32_t at = cond_ring_at++ % (1 << 15);
