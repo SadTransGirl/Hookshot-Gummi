@@ -286,8 +286,34 @@ struct OccSpan {
     int pieces = 0, seen = 0, bad = 0;
 };
 OccSpan occ;
-struct OccResolve { bool fill; uint32_t query; uint32_t value; BufferRef dst[2]; };   // (a query's copy, or a fill: guest memory and the mirror)
+struct OccResolve { bool fill; uint32_t query; uint32_t value; uint64_t addr; BufferRef dst[2]; };   // (a query's copy, or a fill: guest memory and the mirror)
 std::vector<OccResolve> occ_pending;   // (the copies to record once outside the pass)
+// The render conditions on the counts, on the GPU. On the console SetRenderEnableConditional reads the two counter words on the
+// GPU timeline; here it was read on the CPU at replay time, against the 4096 placeholder, so no condition on a count ever
+// turned a draw off (1,200-1,500 a frame in the forest, ~30% of the counts 0). A condition on a word a report wrote, whose
+// other word is a constant (a no-draw report's 0, or a word no report wrote, as the CPU read it), becomes a
+// VK_EXT_conditional_rendering predicate at that word in guest memory: begun at the next draw inside its pass (draw(),
+// occ_draw_hook), ended with the pass, the next condition or RENDER_ENABLE, begun again at the next draw while it holds.
+// Draws only: dispatches and clears take the CPU's answer as before. The CPU's answer also stands for a word still waiting
+// for its copy (report and condition in one pass), two counted words, or no extension. RX_VK_OCC_COND=0: all on the CPU.
+struct GpuCond { bool pending = false, active = false, inverted = false; BufferRef pred; };
+GpuCond gcond;
+std::unordered_map<uint64_t, uint8_t> occ_word_kind;   // (a reported word: 1 a no-draw report's 0, 2 counted on the GPU, 3 the 4096)
+int64_t st_cond_gpu, st_cond_waiting, st_cond_gated_draws;
+bool occ_cond_on() {
+    static const bool on = !getenv("RX_VK_OCC_COND") || atoi(getenv("RX_VK_OCC_COND")) != 0;
+    return on;
+}
+void gcond_end(VkCommandBuffer cmd) {
+    if (!gcond.active) return;
+    vkCmdEndConditionalRenderingEXT(cmd);
+    gcond.active = false;
+}
+bool occ_copy_waiting(uint64_t addr) {
+    for (const OccResolve& p : occ_pending)
+        if (p.addr == addr) return true;
+    return false;
+}
 int64_t st_occ_spans, st_occ_gpu, st_occ_zero, st_occ_queries, st_occ_est[5], st_occ_mirror;
 // (the render conditions: all of them, those on a word a samples-passed report wrote (addr or addr + 16), by mode, and off)
 int64_t st_cond_all, st_cond_queried[2], st_cond_off, st_cond_queried_off;
@@ -345,11 +371,20 @@ void occ_end_query(VkCommandBuffer cmd) {
 // (the hooks vk_draw.cpp calls: mkwvk's, not the anonymous namespace's)
 void occ_pass_ending(VkCommandBuffer cmd) {
     if (occ_pool) occ_end_query(cmd);
+    gcond_end(cmd);
 }
 void occ_pass_ended(VkCommandBuffer cmd) {
     if (occ_pool && !occ_pending.empty()) occ_emit(cmd);
 }
 void occ_draw_hook(VkCommandBuffer cmd, const void* state) {   // (draw(): inside the pass, before the draw call)
+    if (gcond.pending && !gcond.active) {   // (a GPU-evaluated condition in force: from this draw to the pass's end)
+        VkConditionalRenderingBeginInfoEXT bi{VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT};
+        bi.buffer = gcond.pred.buffer, bi.offset = gcond.pred.offset;
+        bi.flags = gcond.inverted ? VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT : 0;
+        vkCmdBeginConditionalRenderingEXT(cmd, &bi);
+        gcond.active = true;
+    }
+    if (gcond.active) st_cond_gated_draws++;
     if (!occ_pool || !occ.open) return;
     if (occ.state != state) {   // (another queue's draw while this span's query is active: counted into it)
         if (occ.query >= 0) occ.bad |= OCC_INTERLEAVED;
@@ -396,6 +431,7 @@ void occ_report(VkCommandBuffer cmd, const NvnState& s, uint64_t addr, uint64_t&
     occ.open = false;
     st_occ_spans++;
     OccResolve r{};
+    r.addr = addr;
     uint64_t pool_lo = 0, pool_size = 0;
     int mstate = -1;
     const bool have = gpu_buffer_pair(addr, 8, &r.dst[0], &r.dst[1], &pool_lo, &pool_size, &mstate) && !(r.dst[0].offset & 7);
@@ -424,6 +460,7 @@ void occ_report(VkCommandBuffer cmd, const NvnState& s, uint64_t addr, uint64_t&
             whole = false;
         }
     }
+    if (occ_word_kind.size() < 65536 || occ_word_kind.count(addr)) occ_word_kind[addr] = occ.seen == 0 ? 1 : (whole && have) ? 2 : 3;
     if (!have) return;
     if (whole) r.fill = false, r.query = (uint32_t)occ.last_query, st_occ_gpu++;
     else r.fill = true, r.value = (uint32_t)value;
@@ -447,10 +484,14 @@ void occ_log(double frames) {
          (st_occ_hist[3] - l_h[3]) / frames, (st_occ_hist[4] - l_h[4]) / frames, (st_occ_hist[5] - l_h[5]) / frames);
     for (int i = 0; i < 6; i++) l_h[i] = st_occ_hist[i];
     static int64_t l_ca, l_cq[2], l_co, l_cqo;
-    logf("vk: occlusion: render conditions a frame: %.1f, %.1f off; on a reported word: %.1f equal-mode, %.1f differ-mode, %.1f off",
+    static int64_t l_cg, l_cw, l_cd;
+    logf("vk: occlusion: render conditions a frame: %.1f, %.1f off on the CPU; on a reported word: %.1f equal-mode, %.1f differ-mode, %.1f off; "
+         "%.1f on the GPU (%.1f draws gated), %.1f waiting for their copy",
          (st_cond_all - l_ca) / frames, (st_cond_off - l_co) / frames, (st_cond_queried[0] - l_cq[0]) / frames,
-         (st_cond_queried[1] - l_cq[1]) / frames, (st_cond_queried_off - l_cqo) / frames);
+         (st_cond_queried[1] - l_cq[1]) / frames, (st_cond_queried_off - l_cqo) / frames, (st_cond_gpu - l_cg) / frames,
+         (st_cond_gated_draws - l_cd) / frames, (st_cond_waiting - l_cw) / frames);
     l_ca = st_cond_all, l_co = st_cond_off, l_cq[0] = st_cond_queried[0], l_cq[1] = st_cond_queried[1], l_cqo = st_cond_queried_off;
+    l_cg = st_cond_gpu, l_cw = st_cond_waiting, l_cd = st_cond_gated_draws;
 }
 
 /// The next recording slot, begun, for the submission that will signal value
@@ -1038,7 +1079,12 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             // to the GPU, a clear earlier in the stream reached guest memory after a later report and wiped it, as far as the GPU
             // was behind: lights and whole rooms switched off by their conditions for a frame. RX_VK_CLEAR_CPU_MAX=0: on the GPU)
             static const uint64_t cpu_max = getenv("RX_VK_CLEAR_CPU_MAX") ? (uint64_t)atoll(getenv("RX_VK_CLEAR_CPU_MAX")) : 256;
-            const bool in_stream = c0.size && c0.size <= cpu_max;
+            // (hookshot) a clear over words the GPU writes (the occlusion counts): on the GPU in order and into guest memory too (the
+            // bound buffer may be the mirror), not on the CPU now, which could wipe a count a GPU-evaluated condition still has to read
+            bool occ_clear = false;
+            if (occ_pool && !occ_words.empty() && c0.size && c0.size <= 4096)
+                for (uint64_t w = c0.dst & ~15ull; w < c0.dst + c0.size && !occ_clear; w += 16) occ_clear = occ_words.count(w) != 0;
+            const bool in_stream = c0.size && c0.size <= cpu_max && !occ_clear;
             if (in_stream && !worker) {
                 uint32_t words[64];
                 for (auto& w : words) w = c0.value;
@@ -1064,6 +1110,10 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             full_barrier(cmd);
             if (dst && !(dst.offset & 3) && !(c.size & 3)) {
                 vkCmdFillBuffer(cmd, dst.buffer, dst.offset, c.size, c.value);
+                if (occ_clear) {   // (and guest memory, where the predicates and the game read the counts)
+                    const BufferRef g = gpu_buffer(c.dst, c.size);
+                    if (g && g.buffer != dst.buffer && !(g.offset & 3)) vkCmdFillBuffer(cmd, g.buffer, g.offset, c.size, c.value);
+                }
                 const uint64_t guest = host->gpu_guest(c.dst);
                 if (guest && !in_stream) memory_stamp_gpu(guest, c.size);
             } else if (!in_stream) {   // (outside the pools or unaligned: on the CPU)
@@ -1275,6 +1325,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
         case NOP_DEPTH_CLAMP: s.depth_clamp = payload<nvn_p_flag>(a, avail).value != 0; break;
         case NOP_RASTER_DISCARD: s.raster_discard = payload<nvn_p_flag>(a, avail).value != 0; break;
         case NOP_RENDER_ENABLE:
+            if (!dry && !worker) gcond_end(cmd), gcond.pending = false;   // (hookshot: a GPU-evaluated condition ends here)
             s.render_enabled = payload<nvn_p_flag>(a, avail).value != 0;
             if (dump_on()) logf("vk: dump-op %03d RENDER_ENABLE %d", dump_seq(), (int)s.render_enabled);
             break;
@@ -1292,6 +1343,31 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             }
             s.render_enabled = r.mode == 0 ? x == y : x != y;
             if (occ_pool) occ_cond(r.addr, (int)r.mode, s.render_enabled);   // (hookshot: counted for the occlusion log)
+            if (!dry) {   // (hookshot) the condition on the GPU, when it can be: GpuCond
+                gcond_end(cmd), gcond.pending = false;
+                if (occ_pool && occ_cond_on() && dev.conditional_rendering && !r.snapped) {
+                    auto kind = [&](uint64_t w) -> int {
+                        auto it = occ_word_kind.find(w);
+                        return it == occ_word_kind.end() ? 0 : it->second;
+                    };
+                    const int kx = kind(r.addr), ky = kind(r.addr + 16);
+                    const bool x_zero = kx == 1 || (kx == 0 && x == 0), y_zero = ky == 1 || (ky == 0 && y == 0);
+                    uint64_t pw = 0;
+                    if (kx == 2 && y_zero) pw = r.addr;
+                    else if (ky == 2 && x_zero) pw = r.addr + 16;
+                    if (pw) {
+                        if (occ_copy_waiting(pw)) st_cond_waiting++;
+                        else {
+                            const BufferRef b = gpu_buffer(pw, 8);
+                            if (b && !(b.offset & 3)) {
+                                gcond.pending = true, gcond.pred = b, gcond.inverted = r.mode == 0;   // (equal to 0: render when the count is 0)
+                                s.render_enabled = true;   // (the GPU decides, draw by draw)
+                                st_cond_gpu++;
+                            }
+                        }
+                    }
+                }
+            }
             {   // (RX_VK_COND_ALWAYS=1 (test): every condition holds. The frame log's dark frames dump the last ones)
                 static const bool always = getenv("RX_VK_COND_ALWAYS") != nullptr;
                 const uint32_t at = cond_ring_at++ % (1 << 15);

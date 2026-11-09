@@ -112,6 +112,10 @@ constexpr VkBufferUsageFlags kUsage =
     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
     VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
     VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT;
+// (hookshot) an imported pool's buffer is a conditional rendering predicate too (the occlusion counts in it, vk_replay.cpp GpuCond)
+VkBufferUsageFlags import_usage() {
+    return kUsage | (dev.conditional_rendering ? VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT : 0);
+}
 
 #ifdef __linux__
 // Guest memory handed to the GPU as a dma-buf over the game's own pages: the window is a memfd's (host/hos_main.c),
@@ -185,7 +189,7 @@ bool import_dma_buf_pieces(uint64_t lo, uint64_t hi, uint64_t piece, Pool& p) {
     bi.pNext = &eb;
     bi.flags = VK_BUFFER_CREATE_SPARSE_BINDING_BIT;
     bi.size = hi - lo;
-    bi.usage = kUsage;
+    bi.usage = import_usage();
     VkBuffer buffer = VK_NULL_HANDLE;
     if (vkCreateBuffer(dev.device, &bi, nullptr, &buffer) != VK_SUCCESS) {
         if (dmabuf_failures++ < 8) logf("vk: pool %#llx..%#llx: no sparse buffer for its dma-bufs", (unsigned long long)lo, (unsigned long long)hi);
@@ -287,7 +291,7 @@ bool import_dma_buf(uint64_t lo, uint64_t hi, Pool& p) {
         VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         bi.pNext = &eb;
         bi.size = hi - lo;
-        bi.usage = kUsage;
+        bi.usage = import_usage();
         VkBuffer buffer = VK_NULL_HANDLE;
         if (vkCreateBuffer(dev.device, &bi, nullptr, &buffer) != VK_SUCCESS) return false;
         const VkDeviceMemory memory = dma_buf_memory(lo, hi - lo);
@@ -384,7 +388,7 @@ bool import_pool(uint64_t lo, uint64_t hi, Pool& p) {
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.pNext = &eb;
     bi.size = bytes;
-    bi.usage = kUsage;
+    bi.usage = import_usage();
     if (vkCreateBuffer(dev.device, &bi, nullptr, &p.buffer) != VK_SUCCESS) {
         import_remember_failure(lo, hi);
         return false;
