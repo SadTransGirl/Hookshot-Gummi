@@ -902,12 +902,20 @@ void cap_buf_retire_holding(std::map<uint32_t, CapBuf>::iterator it, uint64_t co
         for (size_t i = 0; i < b.pages.size(); i++) {
             const uint32_t p = b.pages[i];
             const CapEntry e = cap_entry(p);
-            if (e.gen != g || e.slot != b.slots[i] || page_gen(p) != g) continue;   // (written since, or another capture's copy)
+            // (a page not held over whose entry still names g: cleared, as a retirement leaves it, since g now names the holdover
+            // buffer, smaller than this one: its old slot would read past it (a crash in memory_read_as_submitted))
+            if (e.gen != g || e.slot != b.slots[i] || page_gen(p) != g) {   // (written since, or another capture's copy)
+                if (e.gen == g) cap_entry_set(p, CapEntry{0, 0});
+                continue;
+            }
             const uint64_t a = (uint64_t)p << 12;
             auto pit = imported.upper_bound(a);
             if (pit != imported.begin()) {
                 --pit;
-                if (a < pit->second.hi && pit->second.mstate == Pool::MIRROR_ON && pit->second.synced_gen >= g) continue;   // (the mirror has it)
+                if (a < pit->second.hi && pit->second.mstate == Pool::MIRROR_ON && pit->second.synced_gen >= g) {   // (the mirror has it)
+                    cap_entry_set(p, CapEntry{0, 0});
+                    continue;
+                }
             }
             keep.push_back(p), from.push_back(b.slots[i]);
         }
