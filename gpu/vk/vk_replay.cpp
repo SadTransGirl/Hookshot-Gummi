@@ -2358,6 +2358,9 @@ int wait(uint64_t f, uint64_t timeout_ns) {
 }
 void wait_queue_empty();
 bool replay_behind();
+void wait_queue_settled();
+bool async_unforced_on();
+void settle_unforced();
 void finish() {
     wait_queue_empty();
     wait_value(pushed.load());
@@ -2450,8 +2453,11 @@ void invalidate(uint64_t gpu, uint64_t size) {
             // waits for (OoT's presentation work before the scene's: the fog of the frame before, for a frame, at 1 in 20 of the
             // exposure readbacks). The write-back is waited for on the recordings' timeline instead, which a stopped queue
             // does not hold back
-            const bool unforced = !async_on() && sync_waits_on() && !per_queue_fences_off();
-            if (behind0 && !no_catchup && !unforced) wait_queue_empty(), w = true;   // (work handed over may write it back too)
+            const bool unforced = (async_on() ? async_unforced_on() : sync_waits_on()) && !per_queue_fences_off();
+            if (behind0 && !no_catchup) {   // (work handed over may write it back too)
+                if (!unforced) wait_queue_empty(), w = true;
+                else if (async_on()) wait_queue_settled();   // (recorded, or stopped at an unmet wait: nothing forced)
+            }
             const auto w1 = std::chrono::steady_clock::now();
             const uint64_t v = memory_writeback_value(host->gpu_guest(gpu), size, nullptr);
             if (v > completed()) {
@@ -2499,17 +2505,17 @@ void invalidate(uint64_t gpu, uint64_t size) {
     if (!size) return;
     // (hookshot) and on the submitting thread's replay, the catch-up lets on what may go without forcing anything past its wait
     // (once the exposure readback above no longer did, this one forced OoT's presentation work on, every frame or two)
-    const bool unforced = !async_on() && sync_waits_on() && !per_queue_fences_off();
+    const bool unforced = (async_on() ? async_unforced_on() : sync_waits_on()) && !per_queue_fences_off();
     if (!texture_gpu_written_in(gpu, size)) {
         if (!replay_behind()) return;
         if (!always && !tex_pages_any(gpu, size)) return;   // (no texture's storage there: buffers only)
-        unforced ? sync_settle() : wait_queue_empty();
+        unforced ? settle_unforced() : wait_queue_empty();
         if (!texture_gpu_written_in(gpu, size)) return;
     }
     {   // (what the catch-ups for a texture cost the game's thread, every 300 calls)
         static std::atomic<int64_t> calls{0}, ns{0};
         const auto w0 = std::chrono::steady_clock::now();
-        unforced ? sync_settle() : wait_queue_empty();
+        unforced ? settle_unforced() : wait_queue_empty();
         ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - w0).count();
         if (++calls % 300 == 0)
             logf("vk: invalidate %#llx +%#llx: textures there; the catch-ups waited %.2f ms each (300 calls)",
@@ -3526,6 +3532,8 @@ void replay_thread_main() {
         if (const uint64_t m = host->reserved_cpus()) {
             SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)m);
             logf("vk: the replay thread runs on logical processors %#llx, kept from the game's threads", (unsigned long long)m);
+        } else {
+            logf("vk: the replay thread runs on any core: none reserved (fewer than 8 logical processors, or HOS_RESERVE_CORE=0)");
         }
     }
     for (;;) {
@@ -3549,7 +3557,7 @@ void replay_thread_main() {
             update_blocked();
             std::lock_guard lk(q_mu);
             q_busy = false;
-            if (q_jobs.empty() && !blocked_n.load()) q_idle.notify_all();
+            if (q_jobs.empty()) q_idle.notify_all();   // (each waiter checks its own need: all done, or settled)
             continue;
         }
         // (RX_VK_TIMELINE: one frame's jobs every 240 presents: when the game handed each over, how long it waited
@@ -3618,7 +3626,7 @@ void replay_thread_main() {
         std::lock_guard lk(q_mu);
         if (j.kind == JOB_PRESENT) q_presents--, q_space.notify_all();
         q_busy = false;
-        if (q_jobs.empty() && !blocked_n.load()) q_idle.notify_all();
+        if (q_jobs.empty()) q_idle.notify_all();   // (each waiter checks its own need: all done, or settled)
     }
 }
 
@@ -3665,6 +3673,24 @@ void wait_queue_empty() {
     q_cv.notify_all();
     q_idle.wait(lk, [] { return q_jobs.empty() && !q_busy && blocked_n.load() == 0; });
     drain_waiters--;
+}
+// (hookshot) The asynchronous replay's catch-ups forced every stopped queue past its wait (drain(2)), as the synchronous
+// replay's once did: 16,000 waits gone past in a 3,300-present run, lit passes reading what was not made yet, black frames
+// throughout. A catch-up now waits for the jobs handed over to be recorded or stopped at an unmet wait and forces nothing:
+// a stopped queue goes on at its event's signal, a present, or hold_ms, as the replay thread decides; a readback of work
+// not recorded whole still forces (wait_recorded fails), as the synchronous path does. RX_VK_ASYNC_FORCED=1: as before
+bool async_unforced_on() {
+    static const bool v = !(getenv("RX_VK_ASYNC_FORCED") && atoi(getenv("RX_VK_ASYNC_FORCED")) != 0);
+    return v;
+}
+void wait_queue_settled() {
+    if (!async_on()) return sync_settle();
+    std::unique_lock lk(q_mu);
+    q_cv.notify_all();
+    q_idle.wait(lk, [] { return q_jobs.empty() && !q_busy; });
+}
+void settle_unforced() {
+    wait_queue_settled();
 }
 /// (work handed to the replay thread and not yet recorded)
 bool replay_behind() {
