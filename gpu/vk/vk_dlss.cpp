@@ -55,6 +55,7 @@ struct State {
     std::vector<std::string> inst_names, dev_names;
     std::vector<const char*> inst, devx;
     bool tried = false, started = false, attached = false, failed = false, hooked = false;
+    int failures = 0;   // (evaluations failed in a row: the frame takes the game's upscale and the next tries again; off for good past kMaxFailures)
     const char* reason = "not started";
     struct {
 #define DLSS_ORIG(f) PFN_##f f = nullptr;
@@ -551,20 +552,35 @@ bool dlss_evaluate(VkCommandBuffer cmd, const DlssImage& color, const DlssImage&
                             tm{&rm, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilEvaluate, &render_area},
                             to{&ro, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &output_area};
             const sl::BaseStructure* inputs[] = {&viewport, &tc, &td, &tm, &to};
-            if ((r = st.evaluate_feature(sl::kFeatureDLSS, *frame, inputs, (uint32_t)std::size(inputs),
-                                         reinterpret_cast<sl::CommandBuffer*>(cmd))) != sl::Result::eOk)
-                stage = "slEvaluateFeature";
+            r = st.evaluate_feature(sl::kFeatureDLSS, *frame, inputs, (uint32_t)std::size(inputs), reinterpret_cast<sl::CommandBuffer*>(cmd));
+            if (r == sl::Result::eWarnOutOfVRAM) {   // (a warning, the frame upscaled: Streamline's own VRAM budget is near)
+                static int warned;
+                if (warned++ < 3) logf("vk: dlss: Streamline warns of VRAM pressure (result %d); the frame is upscaled all the same", (int)r);
+                r = sl::Result::eOk;
+            }
+            if (r != sl::Result::eOk) stage = "slEvaluateFeature";
         }
         // back to GENERAL, the output written (also when the evaluation failed: the caller's layouts hold)
         barriers(cmd, {barrier(color, VK_ACCESS_2_SHADER_READ_BIT, any, R, G), barrier(depth, VK_ACCESS_2_SHADER_READ_BIT, any, R, G),
                        barrier(motion, VK_ACCESS_2_SHADER_READ_BIT, any, R, G), barrier(output, dlss_out, any, G, G)});
     }
     if (stage) {
-        st.failed = true;
-        st.reason = "DLSS evaluation failed";
-        logf("vk: dlss: %s failed (result %d): off from now on", stage, (int)r);
+        // (hookshot) one failure turned DLSS off for good: a VRAM squeeze at an area load (result 39 at 10.1 of 10.5 GB) left
+        // the rest of the session on the game's upscale. The frame takes that upscale and the next frame tries again; off for
+        // good only after kMaxFailures in a row (a real loss of the feature)
+        constexpr int kMaxFailures = 120;
+        st.failures++;
+        if (st.failures == 1 || st.failures % 30 == 0 || st.failures >= kMaxFailures)
+            logf("vk: dlss: %s failed (result %d), %d in a row: %s", stage, (int)r, st.failures,
+                 st.failures >= kMaxFailures ? "off from now on" : "this frame on the game's upscale, trying again");
+        if (st.failures >= kMaxFailures) {
+            st.failed = true;
+            st.reason = "DLSS evaluation failed";
+        }
+        st.options_set = false;   // (the options set again at the next try)
         return false;
     }
+    st.failures = 0;
     return true;
 }
 
