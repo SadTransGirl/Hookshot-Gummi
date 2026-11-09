@@ -331,6 +331,17 @@ bool occ_on() {
     static const bool on = getenv("RX_VK_OCC_QUERIES") && atoi(getenv("RX_VK_OCC_QUERIES")) != 0 && par_threads() <= 1;
     return on;
 }
+// (RX_VK_OCC_AB=<presents>: the queries on and off by turns of that many presents, the frame log saying which, so the cost
+// (the queries, the copies, the precise counting) is measured against the gain (the draws the conditions skip) in one run; the
+// GPU-evaluated conditions follow the queries)
+bool occ_ab_on = true;
+int64_t occ_ab_every() {
+    static const int64_t n = getenv("RX_VK_OCC_AB") ? atoll(getenv("RX_VK_OCC_AB")) : 0;
+    return n;
+}
+bool occ_active() {
+    return occ_pool && occ_ab_on;
+}
 /// A recording begun: its range of the pool reset (outside any pass)
 void occ_begin_recording(Recording& r) {
     if (!occ_on()) return;
@@ -385,7 +396,7 @@ void occ_draw_hook(VkCommandBuffer cmd, const void* state) {   // (draw(): insid
         gcond.active = true;
     }
     if (gcond.active) st_cond_gated_draws++;
-    if (!occ_pool || !occ.open) return;
+    if (!occ_active() || !occ.open) return;
     if (occ.state != state) {   // (another queue's draw while this span's query is active: counted into it)
         if (occ.query >= 0) occ.bad |= OCC_INTERLEAVED;
         return;
@@ -407,14 +418,14 @@ void occ_draw_hook(VkCommandBuffer cmd, const void* state) {   // (draw(): insid
 namespace {
 /// NOP_RESET_COUNTER of SAMPLES_PASSED: a span begins (one without its report is dropped)
 void occ_reset(VkCommandBuffer cmd, const NvnState& s) {
-    if (!occ_pool) return;
+    if (!occ_active()) return;
     occ_end_query(cmd);
     occ = OccSpan{};
     occ.open = true, occ.state = &s;
 }
 /// A draw of the stream: the span sees it, and one that did not happen (skipped in draw()) spoils the span
 void occ_draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& da) {
-    if (!occ_pool || !occ.open || occ.state != &s) return draw(cmd, s, da);
+    if (!occ_active() || !occ.open || occ.state != &s) return draw(cmd, s, da);
     int64_t d0, d1, x;
     draw_stats(&d0, &x, &x, &x);
     draw(cmd, s, da);
@@ -426,7 +437,7 @@ void occ_draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& da) {
 /// too, on its timeline, in guest memory and in the pool's VRAM mirror (what the GPU's own readers bind: the game's culling
 /// compute reads these words there): the query's count when the span is whole, the same value otherwise
 void occ_report(VkCommandBuffer cmd, const NvnState& s, uint64_t addr, uint64_t& value) {
-    if (!occ_pool || !occ.open || occ.state != &s) return;
+    if (!occ_active() || !occ.open || occ.state != &s) return;
     occ_end_query(cmd);
     occ.open = false;
     st_occ_spans++;
@@ -471,9 +482,10 @@ void occ_report(VkCommandBuffer cmd, const NvnState& s, uint64_t addr, uint64_t&
 void occ_log(double frames) {
     if (!occ_pool) return;
     static int64_t l_sp, l_gpu, l_zero, l_q, l_est[5], l_mir;
-    logf("vk: occlusion: a frame: %.1f spans, %.1f counted on the GPU, %.1f with no draw (0), %.1f queries; as 4096: %.1f with a draw "
+    const char* phase = occ_ab_every() ? (occ_ab_on ? " [A/B: queries ON]" : " [A/B: queries OFF]") : "";
+    logf("vk: occlusion%s: a frame: %.1f spans, %.1f counted on the GPU, %.1f with no draw (0), %.1f queries; as 4096: %.1f with a draw "
          "skipped, %.1f over a pass or part end, %.1f interleaved, %.1f pool full, %.1f no buffer; %.1f written to a mirror too",
-         (st_occ_spans - l_sp) / frames, (st_occ_gpu - l_gpu) / frames, (st_occ_zero - l_zero) / frames, (st_occ_queries - l_q) / frames,
+         phase, (st_occ_spans - l_sp) / frames, (st_occ_gpu - l_gpu) / frames, (st_occ_zero - l_zero) / frames, (st_occ_queries - l_q) / frames,
          (st_occ_est[0] - l_est[0]) / frames, (st_occ_est[1] - l_est[1]) / frames, (st_occ_est[2] - l_est[2]) / frames,
          (st_occ_est[3] - l_est[3]) / frames, (st_occ_est[4] - l_est[4]) / frames, (st_occ_mirror - l_mir) / frames);
     l_sp = st_occ_spans, l_gpu = st_occ_gpu, l_zero = st_occ_zero, l_q = st_occ_queries, l_mir = st_occ_mirror;
@@ -492,6 +504,13 @@ void occ_log(double frames) {
          (st_cond_gated_draws - l_cd) / frames, (st_cond_waiting - l_cw) / frames);
     l_ca = st_cond_all, l_co = st_cond_off, l_cq[0] = st_cond_queried[0], l_cq[1] = st_cond_queried[1], l_cqo = st_cond_queried_off;
     l_cg = st_cond_gpu, l_cw = st_cond_waiting, l_cd = st_cond_gated_draws;
+    static int64_t ab_calls;
+    if (const int64_t every = occ_ab_every(); every > 0 && ((++ab_calls) * (int64_t)frames) % every == 0) {
+        occ_ab_on = !occ_ab_on;
+        occ.open = false;
+        occ_word_kind.clear();
+        logf("vk: occlusion A/B: the queries %s from here", occ_ab_on ? "ON" : "OFF");
+    }
 }
 
 /// The next recording slot, begun, for the submission that will signal value
@@ -1345,7 +1364,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             if (occ_pool) occ_cond(r.addr, (int)r.mode, s.render_enabled);   // (hookshot: counted for the occlusion log)
             if (!dry) {   // (hookshot) the condition on the GPU, when it can be: GpuCond
                 gcond_end(cmd), gcond.pending = false;
-                if (occ_pool && occ_cond_on() && dev.conditional_rendering && !r.snapped) {
+                if (occ_active() && occ_cond_on() && dev.conditional_rendering && !r.snapped) {
                     auto kind = [&](uint64_t w) -> int {
                         auto it = occ_word_kind.find(w);
                         return it == occ_word_kind.end() ? 0 : it->second;
