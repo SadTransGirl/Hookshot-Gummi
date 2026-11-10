@@ -35,6 +35,19 @@ int main() {
     CHECK(kHoldUnused == 600);
     CHECK(hold_keeps(0) && hold_keeps(60) && hold_keeps(599));   // (out of view for a second: a turning camera brings it back)
     CHECK(!hold_keeps(600) && !hold_keeps(3600));
+    // the reserve: a line five points under the hold's, for the textures unused thirty seconds
+    CHECK(reserve_pct(85) == 80 && reserve_pct(50) == 45 && reserve_pct(3) == 0);
+    CHECK(kReserveUnused == 1800 && kReserveUnused > kHoldUnused);
+    CHECK(hold_target(59, 5000 * MB, 4500 * MB) == UINT64_MAX);          // (used a second ago: stays, whatever the lines ask)
+    CHECK(hold_target(599, 5000 * MB, 4500 * MB) == UINT64_MAX);
+    CHECK(hold_target(600, 5000 * MB, 4500 * MB) == 5000 * MB);          // (unused ten seconds: for the hold's own line)
+    CHECK(hold_target(1799, 5000 * MB, 4500 * MB) == 5000 * MB);
+    CHECK(hold_target(1800, 5000 * MB, 4500 * MB) == 4500 * MB);         // (unused thirty: down to the reserve's line)
+    CHECK(hold_target(600, 0, 4500 * MB) == UINT64_MAX);                 // (the hold's line not crossed: only the long unused go)
+    CHECK(hold_target(1800, 0, 4500 * MB) == 4500 * MB);
+    // a count between the two lines: the reserve asks for less than the budget, the hold for nothing
+    CHECK(held_budget(budget, 5000 * MB, 9000 * MB, 200 * MB, allowed, 85) == budget);
+    CHECK(held_budget(budget, 5000 * MB, 9000 * MB, 200 * MB, allowed, reserve_pct(85)) == 5000 * MB - (9000 - 200 - 8720) * MB);
     // and it is done with live textures once those chosen and the dead render targets together cover the excess
     CHECK(!hold_met(5600 * MB, 0, 0, 5000 * MB));                 // (600 MB over, nothing chosen yet)
     CHECK(!hold_met(5600 * MB, 599 * MB, 0, 5000 * MB));

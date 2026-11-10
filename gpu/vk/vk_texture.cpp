@@ -3795,6 +3795,7 @@ void texture_frame(uint64_t completed) {
     // out. RX_VK_BUDGET_BY_BLOCKS=1: as before)
     static const bool by_blocks = getenv("RX_VK_BUDGET_BY_BLOCKS") != nullptr;
     uint64_t evict_to = 0;   // (hookshot, RX_VK_COMPACT: what an eviction goes down to when the compaction's hold set the budget)
+    uint64_t hold_to = 0;    // (and what the hold's own line asks for, when the reserve's lower line set evict_to)
     // (hookshot, RX_VK_COMPACT) compacted, only the textures' pool's free space comes off the count: vram_compact.h
     uint64_t reclaim = block_free;
     if (compact_on()) {
@@ -3821,6 +3822,11 @@ void texture_frame(uint64_t completed) {
         // was crossed on five passes in a row and the cache went from 4,589 to 2,312 MB (0.875^5) in two seconds, the
         // textures made again at 65-90 ms a frame)
         if (held < budget) budget = evict_to = held;
+        hold_to = evict_to;
+        // (and a reserve under that line, for the textures long unused: vram_compact.h. The pass below takes the others only
+        // for the hold's own line)
+        const uint64_t reserve = vram_compact::held_budget(budget, total_bytes, used, reclaim, allowed, vram_compact::reserve_pct(pct));
+        if (reserve < budget) budget = evict_to = reserve;
     }
     // (hookshot) not while VMA's blocks hold an eighth of the allowance free: new images take that space, the driver's count does
     // not grow, and what this evicts frees space inside the blocks that the count keeps. Ten frames later it squeezed again: a
@@ -3833,7 +3839,7 @@ void texture_frame(uint64_t completed) {
         const uint64_t over = used - allowed / 100 * 97;
         budget = std::min(budget, total_bytes > over ? total_bytes - over : 0);
     }
-    if (budget < evict_to) evict_to = 0;   // (hookshot, RX_VK_COMPACT: the driver's limit asks for more: 7/8 of that, as before)
+    if (budget < evict_to) evict_to = hold_to = 0;   // (hookshot, RX_VK_COMPACT: the driver's limit asks for more: 7/8 of that, as before)
     if (frame_no % 600 == 0) {
         vma_log_heaps();
         vma_log_image_blocks();
@@ -4034,7 +4040,7 @@ void texture_frame(uint64_t completed) {
     uint64_t pending_bytes = 0;   // (chosen below, their bytes not yet off total_bytes)
     // (hookshot, RX_VK_COMPACT) a pass the compaction's hold asked for (evict_to) lets go of the dead render targets as a sweep
     // does, all of them, and of live textures only for the excess left after those, and only of ones long unused: vram_compact.h's
-    // hold_met and hold_keeps. So it does not stop at the first texture past the excess: what the dead targets hold is counted first
+    // hold_met and hold_target. So it does not stop at the first texture past the excess: what the dead targets hold is counted first
     const bool by_hold = evict_to != 0 && !sweep;
     uint64_t hold_dead = 0, hold_live = 0;   // (what the dead targets hold; the live textures chosen so far)
     if (by_hold)
@@ -4066,10 +4072,12 @@ void texture_frame(uint64_t completed) {
         static const bool keep_over_only = getenv("RX_VK_KEEP_RENDERED_OVER") != nullptr;
         const uint64_t keep_rendered = keep_rendered::presents(known, used, allowed, keep_over_only);
         const bool overwritten = shifted || drawn_over(tex);   // (above)
-        // (hookshot, RX_VK_COMPACT: the hold's pass, above. A live texture stays once the excess is covered, and one used lately stays)
-        if (by_hold && !overwritten &&
-            (vram_compact::hold_met(total_bytes, hold_live, hold_dead, evict_to) || vram_compact::hold_keeps(frame_no - last)))
-            continue;
+        // (hookshot, RX_VK_COMPACT: the hold's pass, above. A live texture stays once the excess over its line is covered: the
+        // reserve's line for one long unused, the hold's own for one unused ten seconds; one used since then stays)
+        if (by_hold && !overwritten) {
+            const uint64_t to = vram_compact::hold_target(frame_no - last, hold_to, evict_to);
+            if (to == UINT64_MAX || vram_compact::hold_met(total_bytes, hold_live, hold_dead, to)) continue;
+        }
         if (finalized_kept && keep_finalized(tex)) {   // (above. Oldest first: beyond the cap the least recently used go)
             if (finalized_kept <= keep_finalized_max) continue;
             finalized_kept -= tex->bytes;

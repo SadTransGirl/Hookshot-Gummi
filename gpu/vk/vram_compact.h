@@ -48,6 +48,24 @@ inline constexpr uint64_t kHoldUnused = 600;
 /// Whether the hold's pass keeps a texture no render target has drawn over: one used in the last kHoldUnused presents
 inline bool hold_keeps(uint64_t unused) { return unused < kHoldUnused; }
 
+/// The reserve: a second line, kReservePoints points of the allowance under the hold's own (80 for 85). Over it the hold lets go
+/// of textures unused for kReserveUnused presents (30 seconds at 60 fps), down to that line. With one line the cache sat at it,
+/// and whatever came in next went over: in a walk across Hyrule Field at DLAA with 768 MB of the card held by something else the
+/// count was over 85% of the allowance for 47-68% of the time and over 87% for 7-26% (peaks of 91-93%), and in play with a
+/// recorder running the GPU's frame went from 11 to 15-23 ms for ten seconds each time it reached 87-90%. With the reserve:
+/// over 85% for 5%, over 87% for 0-1%, peaks of 87-88%, no more uploads
+inline constexpr uint64_t kReservePoints = 5;
+inline constexpr uint64_t kReserveUnused = 1800;
+inline uint64_t reserve_pct(uint64_t pct) { return pct > kReservePoints ? pct - kReservePoints : 0; }
+
+/// What a live texture unused for that many presents may be let go down to in the hold's pass: the reserve's line (reserve_to)
+/// when long unused; the hold's own (hold_to, 0 while that line is not crossed) when unused for kHoldUnused; UINT64_MAX: it stays
+inline uint64_t hold_target(uint64_t unused, uint64_t hold_to, uint64_t reserve_to) {
+    if (hold_keeps(unused)) return UINT64_MAX;
+    if (unused >= kReserveUnused) return reserve_to;
+    return hold_to ? hold_to : UINT64_MAX;
+}
+
 /// Whether the hold's pass is done with live textures: those it has chosen (live) and the dead render targets it lets go in any
 /// case (dead) bring what the textures hold (total) down to evict_to. The dead ones count first: they are the youngest of the
 /// textures, and a pass that stopped at the first texture past the excess, oldest first, never reached them, so while the hold
