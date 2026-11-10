@@ -38,4 +38,24 @@ inline uint64_t held_budget(uint64_t budget, uint64_t total, uint64_t used, uint
     return std::min(budget, total > over ? total - over : 0);
 }
 
+/// What the hold lets go of has gone unused for this many presents (ten seconds at 60 fps). The eviction's own 60 is right for a
+/// budget that is a size: over it, something has to go. The hold's line is crossed for as long as the rest of the game's VRAM
+/// leaves the scene's textures no room under it, and then every texture out of view for a second went and came back when the
+/// camera turned: with the count held under a 7 GB allowance, a turning camera in Hyrule Field at DLAA let go of 2.3-2.6 GB of live
+/// textures every 600 presents and uploaded 6.8 GB in 50 seconds, against 1.4 GB with the compaction off
+inline constexpr uint64_t kHoldUnused = 600;
+
+/// Whether the hold's pass keeps a texture no render target has drawn over: one used in the last kHoldUnused presents
+inline bool hold_keeps(uint64_t unused) { return unused < kHoldUnused; }
+
+/// Whether the hold's pass is done with live textures: those it has chosen (live) and the dead render targets it lets go in any
+/// case (dead) bring what the textures hold (total) down to evict_to. The dead ones count first: they are the youngest of the
+/// textures, and a pass that stopped at the first texture past the excess, oldest first, never reached them, so while the hold
+/// was on, live textures went in their place and the dead targets piled up (0.9 to 3.5 GB of them in 120 presents as a new
+/// stretch of Hyrule Field came in, the count over what the driver allows, frames of 60-128 ms for three seconds)
+inline bool hold_met(uint64_t total, uint64_t live, uint64_t dead, uint64_t evict_to) {
+    const uint64_t going = live + dead;
+    return going >= total || total - going <= evict_to;
+}
+
 }   // namespace vram_compact

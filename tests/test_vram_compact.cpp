@@ -31,6 +31,19 @@ int main() {
     CHECK(held_budget(budget, 300 * MB, 10800 * MB, 0, allowed, 85) == 0);                      // (the excess is more than the textures hold)
     CHECK(held_budget(budget, 5600 * MB, 10023 * MB, 215 * MB, 0, 85) == budget);               // (no allowance known: left alone)
     CHECK(held_budget(budget, 5600 * MB, 100 * MB, 215 * MB, allowed, 85) == budget);           // (more to give back than is used)
+    // the hold's pass keeps a live texture used in the last ten seconds: the eviction's own 60 presents is not enough for it
+    CHECK(kHoldUnused == 600);
+    CHECK(hold_keeps(0) && hold_keeps(60) && hold_keeps(599));   // (out of view for a second: a turning camera brings it back)
+    CHECK(!hold_keeps(600) && !hold_keeps(3600));
+    // and it is done with live textures once those chosen and the dead render targets together cover the excess
+    CHECK(!hold_met(5600 * MB, 0, 0, 5000 * MB));                 // (600 MB over, nothing chosen yet)
+    CHECK(!hold_met(5600 * MB, 599 * MB, 0, 5000 * MB));
+    CHECK(hold_met(5600 * MB, 600 * MB, 0, 5000 * MB));
+    CHECK(hold_met(5600 * MB, 0, 600 * MB, 5000 * MB));           // (the dead targets alone cover it: no live texture goes)
+    CHECK(hold_met(5600 * MB, 0, 2500 * MB, 5000 * MB));          // (the walk's 2.5 GB of dead targets)
+    CHECK(!hold_met(5600 * MB, 100 * MB, 400 * MB, 5000 * MB));   // (100 MB still to go)
+    CHECK(hold_met(5600 * MB, 200 * MB, 400 * MB, 5000 * MB));
+    CHECK(hold_met(300 * MB, 200 * MB, 200 * MB, 0));             // (more chosen than the textures hold, their sum having drifted)
     std::printf("PASS: the compaction's rules\n");
     return 0;
 }

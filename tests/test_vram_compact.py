@@ -53,7 +53,16 @@ def check_source():
           "vram_compact::held_budget(budget, total_bytes, used, reclaim, allowed, pct)", 'getenv("RX_VK_COMPACT_PCT")',
           # (the hold lets go of the excess alone, not of an eighth of the cache; the driver's limit still asks for 7/8)
           "if (held < budget) budget = evict_to = held;", "if (budget < evict_to) evict_to = 0;",
-          "total_bytes - pending_bytes <= (evict_to ? evict_to : budget / 8 * 7)"])
+          # (the hold's pass: every dead render target, and live textures only for the excess left and only long unused ones;
+          # it does not stop at the first texture past the excess, which kept it from the dead targets, the youngest)
+          "const bool by_hold = evict_to != 0 && !sweep;",
+          "if (shifted || drawn_over(tex)) hold_dead += tex->bytes + tex->pad;",
+          "if ((!sweep && !by_hold && (pending_bytes >= total_bytes || total_bytes - pending_bytes <= budget / 8 * 7)) ||",
+          "(vram_compact::hold_met(total_bytes, hold_live, hold_dead, evict_to) || vram_compact::hold_keeps(frame_no - last))",
+          "if (by_hold && !overwritten) hold_live += tex->bytes + tex->pad;"])
+    # (and a live texture is judged by the hold only once it is known whether a render target drew over it)
+    if not frame.index("const bool overwritten = shifted || drawn_over(tex);") < frame.index("vram_compact::hold_met(total_bytes"):
+        raise SystemExit("vk_texture.cpp: the hold's pass judges a texture before it knows whether it is a dead render target")
     need("vk_texture.cpp: compact_step()", block(tex, "void compact_step(uint64_t completed)"),
          ["if (!compact_on()) return;", "vram_compact::run_from(min_free, compact.pressed)", "vram_compact::rest(compact.pressed)",
           "t != present_source", "image_compact_ignore(i);", "destroy_gen++;"])
