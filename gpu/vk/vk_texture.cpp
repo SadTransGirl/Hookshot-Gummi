@@ -276,8 +276,8 @@ std::mutex pool_mu;
 std::unordered_map<uint64_t, std::vector<Pooled>> target_pool;   // by pool_key_of
 uint64_t pool_bytes, pool_n, st_pool_reused, st_pool_made, st_pool_destroyed;
 bool pool_pressed;   // (VRAM near what the driver allows: texture_frame's budget)
-bool compact_on() {   // (hookshot, RX_VK_COMPACT=1: the textures in a pool of their own, compacted: compact_step)
-    static const bool v = getenv("RX_VK_COMPACT") && atoi(getenv("RX_VK_COMPACT")) != 0;
+bool compact_on() {   // (hookshot: the textures in a pool of their own, compacted: compact_step. On unless RX_VK_COMPACT=0)
+    static const bool v = vram_compact::enabled(getenv("RX_VK_COMPACT"));
     return v;
 }
 uint64_t pool_cap() {
@@ -3472,10 +3472,11 @@ VkBufferView texel_buffer_view(const nvn_tex* t, const nvn_view* v, bool storage
     return view;
 }
 
-// ---- (hookshot) VRAM compacted (RX_VK_COMPACT=1; off by default) ----
+// ---- (hookshot) VRAM compacted (on by default since the hold lets go of the dead render targets first and of long-unused
+// textures only; RX_VK_COMPACT=0: off, as before) ----
 // An evicted texture's memory stays inside its 128 MB block, and the driver counts the block whole: after some play 0.6 to
 // 1.6 GB of what the driver counts is such free space (3 to 4 GB after the cache was emptied), and evicting more gives
-// none of it back. With RX_VK_COMPACT=1 the textures that are not render targets have a pool of their own (vk_vma.cpp; the targets have theirs) and, when RX_VK_COMPACT_MB (512)
+// none of it back. Compacted, the textures that are not render targets have a pool of their own (vk_vma.cpp; the targets have theirs) and, when RX_VK_COMPACT_MB (512)
 // or more of it is free space, VMA's defragmentation moves textures out of the sparsely used blocks, a few a pass: a new
 // image at the new place, the texels copied on the GPU in the present's upload commands (every draw of the frame is in an
 // earlier recording), the texture's views made again when next asked for, and the old image destroyed once the GPU is past

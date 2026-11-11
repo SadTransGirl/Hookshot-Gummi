@@ -1,4 +1,4 @@
-// (hookshot) The compaction's rules (RX_VK_COMPACT=1; vk_texture.cpp's compact_step and the texture budget), apart from Vulkan so
+// (hookshot) The compaction's rules (on unless RX_VK_COMPACT=0; vk_texture.cpp's compact_step and the texture budget), apart from Vulkan so
 // that tests/test_vram_compact.py can run them.
 //
 // The driver counts VMA's blocks whole. An evicted texture's memory stays inside its 128 MB block, so the count keeps what the
@@ -10,8 +10,13 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 
 namespace vram_compact {
+
+/// Whether the textures are compacted, by RX_VK_COMPACT as the environment has it: on when it is not set, off for 0 (or empty).
+/// It was opt-in (RX_VK_COMPACT=1) while its hold could let go of textures in use; that is what hold_keeps and hold_met are for
+inline bool enabled(const char* env) { return !env || atoi(env) != 0; }
 
 /// The driver's count over 90% of what it allows: a run starts for less free space, and the next one sooner
 inline bool pressed(uint64_t used, uint64_t allowed) { return allowed && used > allowed / 10 * 9; }

@@ -1,5 +1,5 @@
 """Compile and run the VRAM compaction's rules (gpu/vk/vram_compact.h; no game/GPU required), and check that vk_texture.cpp and
-vk_vma.cpp still use them: the textures in a pool of their own only with RX_VK_COMPACT, nothing of that pool freed while a pass is
+vk_vma.cpp still use them: the textures in a pool of their own unless RX_VK_COMPACT=0, nothing of that pool freed while a pass is
 open, and the budget holding the driver's count with the textures' free space alone taken off.
 
 python -I -B tests/test_vram_compact.py [--cxx g++]
@@ -33,8 +33,8 @@ def need(where, text, needles):
 def check_source():
     tex = (ROOT / "gpu/vk/vk_texture.cpp").read_text(encoding="utf-8")
     vma = (ROOT / "gpu/vk/vk_vma.cpp").read_text(encoding="utf-8")
-    # (the compaction is opt-in)
-    need("vk_texture.cpp: compact_on()", block(tex, "bool compact_on()"), ['getenv("RX_VK_COMPACT")'])
+    # (the compaction is on unless RX_VK_COMPACT=0: the rule is vram_compact::enabled, run below)
+    need("vk_texture.cpp: compact_on()", block(tex, "bool compact_on()"), ['vram_compact::enabled(getenv("RX_VK_COMPACT"))'])
     # (a texture that is not a render target's goes to the textures' pool only when they are compacted, in a branch before the
     # render targets' pool and blocks, which stay as they are)
     make = block(tex, "Texture* create(const Key& key")

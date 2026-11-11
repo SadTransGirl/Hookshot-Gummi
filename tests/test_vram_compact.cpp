@@ -9,6 +9,10 @@
 int main() {
     using namespace vram_compact;
     const uint64_t MB = 1ull << 20;
+    // on unless RX_VK_COMPACT says 0: not set is on (the default), and 1 still is
+    CHECK(enabled(nullptr));
+    CHECK(enabled("1") && enabled("2"));
+    CHECK(!enabled("0") && !enabled(""));
     // pressed: the driver's count over 90% of what it allows; never without an allowance
     CHECK(!pressed(9000 * MB, 10900 * MB));
     CHECK(pressed(10023 * MB, 10900 * MB));   // (the uncompacted walk's count)
