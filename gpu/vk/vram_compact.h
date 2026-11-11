@@ -63,12 +63,24 @@ inline constexpr uint64_t kReservePoints = 5;
 inline constexpr uint64_t kReserveUnused = 1800;
 inline uint64_t reserve_pct(uint64_t pct) { return pct > kReservePoints ? pct - kReservePoints : 0; }
 
-/// What a live texture unused for that many presents may be let go down to in the hold's pass: the reserve's line (reserve_to)
-/// when long unused; the hold's own (hold_to, 0 while that line is not crossed) when unused for kHoldUnused; UINT64_MAX: it stays
-inline uint64_t hold_target(uint64_t unused, uint64_t hold_to, uint64_t reserve_to) {
-    if (hold_keeps(unused)) return UINT64_MAX;
-    if (unused >= kReserveUnused) return reserve_to;
-    return hold_to ? hold_to : UINT64_MAX;
+/// What the rules that are not the hold's (the budget's size, the 90% rule, the driver's limit at 97%) ask an eviction to go down
+/// to on their own: 7/8 of their budget once the textures hold more than it, as a pass over the budget cuts with the compaction
+/// off; UINT64_MAX: nothing
+inline uint64_t rule_target(uint64_t total, uint64_t rule_budget) { return total > rule_budget ? rule_budget / 8 * 7 : UINT64_MAX; }
+
+/// What a live texture unused for that many presents may be let go down to in the hold's pass, the lowest of the lines that
+/// apply to it; UINT64_MAX: it stays. Three tiers:
+/// - unused for need_unused (the eviction's own 60 presents): what the other rules ask for (rule_to). Over 90% of the allowance
+///   or over the budget's size something has to go now, and the hold's patience is not theirs: with the hold's two thresholds
+///   alone, a pass the 90% rule asked for took nothing used in the last ten seconds, and the reserve's lower budget made every
+///   such pass a hold's pass, on the cards whose count sits past 90%
+/// - unused for kHoldUnused: the hold's own line too (hold_to, 0 while it is not crossed)
+/// - unused for kReserveUnused: and the reserve's (reserve_to)
+inline uint64_t hold_target(uint64_t unused, uint64_t need_unused, uint64_t rule_to, uint64_t hold_to, uint64_t reserve_to) {
+    uint64_t to = unused >= need_unused ? rule_to : UINT64_MAX;
+    if (!hold_keeps(unused) && hold_to) to = std::min(to, hold_to);
+    if (unused >= kReserveUnused) to = std::min(to, reserve_to);
+    return to;
 }
 
 /// Whether the hold's pass is done with live textures: those it has chosen (live) and the dead render targets it lets go in any

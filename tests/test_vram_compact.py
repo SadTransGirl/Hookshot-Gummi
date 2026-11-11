@@ -58,7 +58,11 @@ def check_source():
           "const bool by_hold = evict_to != 0 && !sweep;",
           "if (shifted || drawn_over(tex)) hold_dead += tex->bytes + tex->pad;",
           "if ((!sweep && !by_hold && (pending_bytes >= total_bytes || total_bytes - pending_bytes <= budget / 8 * 7)) ||",
-          "const uint64_t to = vram_compact::hold_target(frame_no - last, hold_to, evict_to);",
+          "const uint64_t to = vram_compact::hold_target(frame_no - last, need_unused, rule_to, hold_to, evict_to);",
+          # (and what the other rules ask on their own is kept from before the hold's lines, the 97% rule's with it, for the
+          # pass's third tier: a texture unused for the eviction's own time goes for that part)
+          "uint64_t rule_budget = budget;", "rule_budget = std::min(rule_budget, total_bytes > over ? total_bytes - over : 0);",
+          "const uint64_t rule_to = vram_compact::rule_target(total_bytes, rule_budget);",
           "if (to == UINT64_MAX || vram_compact::hold_met(total_bytes, hold_live, hold_dead, to)) continue;",
           # (the reserve: a lower line that sets the budget too, the hold's own line kept for the textures not long unused;
           # the driver's limit, when it asks for more, clears both)
