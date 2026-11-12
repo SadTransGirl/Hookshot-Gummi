@@ -20,6 +20,7 @@ FIXTURE = r"""
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+@TRANSLATE_WAIT_H@
 #define PROF_EXACT() ((void)0)
 #define PROF_HOT(x) ((void)0)
 #define SKIP_HERE() return
@@ -33,6 +34,7 @@ struct Stage { Info info; };
 int scans, early_reads, translation_waits, bounded_waits, pipeline_waits, draws, output, st_waits, st_pending_skips;
 bool fast_translation;   // (whether the bounded wait sees the translation finish)
 double st_wait_ms;
+void logf(const char*, ...) {}
 // Instrument only fixture iteration: reject inspecting ordinary stages before acquire-ready publication.
 struct Stages {
     std::atomic<bool>* ready;
@@ -103,15 +105,20 @@ void decision(const Program* cp, const Targets& at) {
 int failures;
 void check(bool ok, const char* label) { if (!ok) { ++failures; std::printf("FAIL %s\n", label); } }
 void scenario(int kind, bool translated, bool pipeline_hot, bool persistent, bool fast = true) {
-    scans = early_reads = translation_waits = bounded_waits = pipeline_waits = draws = output = st_pending_skips = 0;
+    scans = early_reads = translation_waits = bounded_waits = pipeline_waits = draws = output = st_pending_skips = st_waits = 0;
     Program p; current = &p; effect = kind; fast_translation = fast;
     if (translated) publish();
     pipe_entry.ready.store(pipeline_hot, std::memory_order_release);
     const bool force = std::getenv("RX_VK_PIPE_SKIP") && std::atoi(std::getenv("RX_VK_PIPE_SKIP")) == 0;
     const bool legacy = std::getenv("RX_VK_PIPE_SKIP") && std::atoi(std::getenv("RX_VK_PIPE_SKIP")) == 2;
-    // (default and 1: an unknown translation on persistent targets is waited for within a frame's bound, then left out)
-    const bool bounded = !force && !legacy && !translated && persistent;
-    const bool skip_unknown = (legacy && !translated && persistent) || (bounded && !fast);
+    // (RX_VK_TRANSLATE_WAIT_MS set to a number of 0 or more, default and mode 1: an unknown translation on persistent targets
+    // is waited for within a frame's bound, then left out; unset, negative or not a number: waited out, as #1573)
+    double wait_ms = -1;
+    const char* w = std::getenv("RX_VK_TRANSLATE_WAIT_MS");
+    if (!w || !translate_wait::parse(w, wait_ms)) wait_ms = -1;
+    const bool bounded = wait_ms >= 0 && !force && !legacy && !translated && persistent;
+    const bool spent = wait_ms <= 0;   // (a bound of 0: no wait at all, and none counted)
+    const bool skip_unknown = (legacy && !translated && persistent) || (bounded && (!fast || spent));
     const bool should_draw = !skip_unknown && (pipeline_hot || force || !persistent || kind != 0);
     decision(&p, {persistent});
     char label[120];
@@ -122,7 +129,8 @@ void scenario(int kind, bool translated, bool pipeline_hot, bool persistent, boo
     if (kind && should_draw) check(output == 42, "producer write absent at fake consumer");
     check(!early_reads, "metadata inspected before publication");
     check(translation_waits == int(!translated && !skip_unknown && !bounded), "translation wait mode");
-    check(bounded_waits == int(bounded), "bounded translation wait mode");
+    check(bounded_waits == int(bounded && !spent), "bounded translation wait mode");
+    check(st_waits == int(bounded && !spent) + (translation_waits + pipeline_waits), "a wait counted only when it could wait");
     if (pipeline_hot || force || !persistent || skip_unknown) check(scans == 0, "unnecessary classification");
     check(pipeline_waits == int(!pipeline_hot && should_draw), "pending pipeline must publish before draw");
     std::printf("%s %s draws%d skips%d scans%d twait%d pwait%d\n", failures == before ? "PASS" : "RED", label,
@@ -138,6 +146,12 @@ int main() {
     // (a translation that does not finish within the frame's bound: left out on persistent targets by default)
     for (int kind = 0; kind <= 4; ++kind)
         for (bool hot : {false, true}) scenario(kind, false, hot, true, false);
+    // (the switch's value: a typo is not read as 0)
+    double v = 0;
+    check(translate_wait::parse("8", v) && v == 8, "parse 8");
+    check(translate_wait::parse(" 2.5 ", v) && v == 2.5, "parse 2.5 with spaces");
+    check(translate_wait::parse("-1", v) && v == -1, "parse -1");
+    for (const char* bad : {"", "8ms", "off", "nan", "inf", " "}) check(!translate_wait::parse(bad, v), "parse rejects a non-number");
     std::printf("%d failures; fake CPU decision check only\n", failures);
     return failures ? 1 : 0;
 }
@@ -157,30 +171,37 @@ def main():
         end = src.index("    cur_program = &p;", start)
     except ValueError:
         raise SystemExit("draw readiness block changed; update this test's extraction anchors") from None
-    fixture = FIXTURE.replace("@WRITES_MEMORY@", src[helper_start:helper_end]).replace("@BLOCK@", src[start:end])
+    header = (args.source / "gpu/vk/translate_wait.h").read_text(encoding="utf-8").replace("#pragma once", "")
+    fixture = (FIXTURE.replace("@WRITES_MEMORY@", src[helper_start:helper_end]).replace("@BLOCK@", src[start:end])
+               .replace("@TRANSLATE_WAIT_H@", header))
     with tempfile.TemporaryDirectory(prefix="draw-side-effects-") as tmp:
         cpp, exe = Path(tmp) / "test.cpp", Path(tmp) / "test"
         cpp.write_text(fixture, encoding="utf-8")
         subprocess.run([args.cxx, "-std=c++20", "-Wall", "-Wextra", "-Wno-unused-variable",
                         str(cpp), "-o", str(exe)], check=True, timeout=60)
         failed = False
-        for mode in (None, "0", "1", "2"):
+        for mode, wait in [(m, w) for m in (None, "0", "1", "2") for w in (None, "8", "0", "8ms")]:
             env = os.environ.copy()
             env.pop("RX_VK_PIPE_SKIP", None)
+            env.pop("RX_VK_TRANSLATE_WAIT_MS", None)
             if mode is not None:
                 env["RX_VK_PIPE_SKIP"] = mode
+            if wait is not None:
+                env["RX_VK_TRANSLATE_WAIT_MS"] = wait
             result = subprocess.run([str(exe)], env=env, capture_output=True, text=True, timeout=10)
             lines = result.stdout.splitlines()
             complete = "0 failures; fake CPU decision check only" in lines and sum(l.startswith("PASS kind") for l in lines) == 33
             ok = result.returncode == 0 and complete
-            print(f"RX_VK_PIPE_SKIP={mode if mode is not None else 'unset'}: {'PASS' if ok else 'FAIL'}")
+            print(f"RX_VK_PIPE_SKIP={mode if mode is not None else 'unset'} RX_VK_TRANSLATE_WAIT_MS={wait if wait is not None else 'unset'}: "
+                  f"{'PASS' if ok else 'FAIL'}")
             if not ok:
                 failed = True
                 print("fixture failed or did not finish all 33 cases\n" + result.stdout + result.stderr)
         if failed:
             raise SystemExit(1)
-    print("PASS: unknown translations wait within a frame's bound by default, then are left out on persistent targets; mode 0 "
-          "waits them out; mode 2 restores their old skip; translated writers wait; hot draws do not scan stages")
+    print("PASS: unknown translations are waited out by default; with RX_VK_TRANSLATE_WAIT_MS they wait within a frame's bound, "
+          "then are left out on persistent targets (a bound of 0 counts no wait; a non-number is ignored); mode 0 waits them out; "
+          "mode 2 restores their old skip; translated writers wait; hot draws do not scan stages")
 
 
 if __name__ == "__main__":

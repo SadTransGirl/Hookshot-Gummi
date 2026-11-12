@@ -52,6 +52,7 @@
 #include "skip_code.h"
 #include "driver_faults.h"
 #include "fallback_size_policy.h"
+#include "translate_wait.h"
 
 #include "shaders/clear_f_frag_spv.h"
 #include "shaders/clear_i_frag_spv.h"
@@ -6540,15 +6541,26 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         st_waits++;
         st_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     };
-    // (hookshot) A translation not ready, for a draw whose targets hold an earlier frame's picture: waited for at most
-    // RX_VK_TRANSLATE_WAIT_MS (8) a frame in all, on each recording thread, without taking the job onto this thread, and then
-    // left out of the frame. Waiting it out (#1573) brought back the 0.2-3 s pauses at an area's first new programs, the most
-    // reported stutter (#1573's own run: 3.12 s of waits against 0.92 s); left out at once (v2.1.0, RX_VK_PIPE_SKIP=2) it
-    // lost the writes of translations that finish in a moment. A target made this frame still waits it out.
-    // RX_VK_TRANSLATE_WAIT_MS=-1: always waited out, as #1573
+    // (hookshot) RX_VK_TRANSLATE_WAIT_MS=<ms> (off unless set): a translation not ready, for a draw whose targets hold an
+    // earlier frame's picture, is waited for at most this long a frame in all, on each recording thread, without taking the
+    // job onto this thread, and the draw is then left out of the frame. Waiting it out (#1573, the default) can bring back
+    // the 0.2-3 s pauses at an area's first new programs on a cold program bank; leaving it out at once (RX_VK_PIPE_SKIP=2)
+    // lost the writes of translations that finish in a moment. With the bound, a translation slower than it can still lose a
+    // memory write (its writes are not known before it is translated): so it is opt-in until it has been tested on more
+    // machines. A target made this frame still waits it out. A value that is not a number is ignored with a warning.
     static const double translate_wait_ms = [] {
+        double ms = translate_wait::kOff;
         const char* e = getenv("RX_VK_TRANSLATE_WAIT_MS");
-        return e ? atof(e) : 8.0;
+        if (e && !translate_wait::parse(e, ms)) {
+            ms = translate_wait::kOff;
+            logf("vk: RX_VK_TRANSLATE_WAIT_MS=%s is not a number of milliseconds: ignored", e);
+        }
+        if (e && ms >= 0)
+            logf("vk: a shader still translating is waited for at most %.1f ms a frame on each recording thread, then its draws "
+                 "on earlier frames' targets are left out (RX_VK_TRANSLATE_WAIT_MS)", ms);
+        else if (e)
+            logf("vk: shaders still translating are waited out (RX_VK_TRANSLATE_WAIT_MS off)");
+        return ms;
     }();
     if (!cp->ready.load(std::memory_order_acquire)) {
         if (legacy_translation_skip && targets_persistent(at)) return void(st_pending_skips++);
@@ -6557,12 +6569,18 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
             static thread_local double budget_left = 0;
             const uint64_t frame = texture_frame_no();
             if (frame != budget_frame) budget_frame = frame, budget_left = translate_wait_ms;
-            const auto t0 = std::chrono::steady_clock::now();
-            const bool ready = jobs_wait_for(cp->ready, budget_left);
-            const double took = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-            budget_left -= took;
-            st_waits++;
-            st_wait_ms += took;
+            bool ready;
+            if (budget_left > 0) {   // (counted as a wait only when it can wait: the stat #1573 was judged on stays honest)
+                PROF_EXACT();
+                const auto t0 = std::chrono::steady_clock::now();
+                ready = jobs_wait_for(cp->ready, budget_left);
+                const double took = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                budget_left -= took;
+                st_waits++;
+                st_wait_ms += took;
+            } else {
+                ready = cp->ready.load(std::memory_order_acquire);
+            }
             if (!ready) return void(st_pending_skips++);
         } else {
             wait_for(cp->ready);
