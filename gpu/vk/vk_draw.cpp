@@ -42,6 +42,7 @@
 #include "vk_fsr3_inputs.h"
 #include "reactive_policy.h"
 #include "upscaler_rows.h"
+#include "pcache_stamp.h"
 #include "vk_reactive.h"   // (the upscalers' reactive mask: the scene copied before its transparent draws)
 #include "vk_dump.h"
 #include "vk_gprof.h"
@@ -52,6 +53,7 @@
 #include "skip_code.h"
 #include "driver_faults.h"
 #include "fallback_size_policy.h"
+#include "translate_wait.h"
 
 #include "shaders/clear_f_frag_spv.h"
 #include "shaders/clear_i_frag_spv.h"
@@ -941,6 +943,33 @@ bool play_cache_in_use() { return play_cache.load() != nullptr; }
 // ---- (end of the play caches) ----
 
 bool pcache_no_save = false;   // (RX_VK_PCACHE_LOAD=0: pcache_init)
+// (RX_VK_PCACHE_LOAD=0, an A/B of what the file costs in memory: its 2.5 GB read whole and held by the driver. The cache
+// starts empty and is not saved; the driver's own shader cache is all there is)
+bool pcache_load_off() {
+    static const bool off = [] { const char* e = getenv("RX_VK_PCACHE_LOAD"); return e && env_value_off(e); }();   // (hookshot_env.h: 0/off/false/no)
+    return off;
+}
+/// (hookshot) The pipeline cache's files go when they were made for another translator than this one (program_cache_stamp,
+/// which the program cache and the prepare record start over by): their pipelines can no longer be hit, and the file only grew,
+/// read whole at every start and held by the driver (pcache_stamp.h). Once a run, before the first of pcache_init and
+/// prepare_run: whether files went, so that prepare_run makes the stage libraries the warm pass kept in them again
+/// (prepared_for.warmed), whatever its record says. RX_VK_PCACHE_STAMP=0: kept whatever made them, as before
+bool pcache_drop_stale() {
+    static const bool dropped = [] {
+        static const bool by_stamp = [] { const char* e = getenv("RX_VK_PCACHE_STAMP"); return !e || !env_value_off(e); }();
+        if (pcache_load_off() || !by_stamp) return false;
+        char exe[MAX_PATH];
+        const DWORD n = game_module_path(exe, MAX_PATH);
+        std::string dir(exe, n);
+        dir = dir.substr(0, dir.find_last_of("\\/") + 1);
+        const pcache_stamp::Dropped gone = pcache_stamp::check(dir, program_cache_stamp());
+        if (gone.files)
+            logf("vk: pipeline cache: %zu files made for another translator dropped (%llu MB); it starts empty", gone.files,
+                 (unsigned long long)(gone.bytes >> 20));
+        return gone.files > 0;
+    }();
+    return dropped;
+}
 void pcache_init() {
     if (pcache) return;
     char exe[MAX_PATH];
@@ -948,10 +977,9 @@ void pcache_init() {
     std::string dir(exe, n);
     pcache_dir = dir = dir.substr(0, dir.find_last_of("\\/") + 1);
     pcache_path = dir + "mkw_vk_pipelines.bin";
-    // (RX_VK_PCACHE_LOAD=0, an A/B of what the file costs in memory: its 2.5 GB read whole and held by the driver. The cache
-    // starts empty and is not saved; the driver's own shader cache is all there is)
-    static const bool off = getenv("RX_VK_PCACHE_LOAD") && atoi(getenv("RX_VK_PCACHE_LOAD")) == 0;
+    const bool off = pcache_load_off();
     pcache_no_save = off;
+    pcache_drop_stale();   // (before the files are read)
     std::vector<uint8_t> data = off ? std::vector<uint8_t>{} : pcache_file_read(pcache_path);
     VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     ci.initialDataSize = data.size();
@@ -6757,9 +6785,50 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         st_waits++;
         st_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     };
+    // (hookshot) RX_VK_TRANSLATE_WAIT_MS=<ms> (off unless set): a translation not ready, for a draw whose targets hold an
+    // earlier frame's picture, is waited for at most this long a frame in all, on each recording thread, without taking the
+    // job onto this thread, and the draw is then left out of the frame. Waiting it out (#1573, the default) can bring back
+    // the 0.2-3 s pauses at an area's first new programs on a cold program bank; leaving it out at once (RX_VK_PIPE_SKIP=2)
+    // lost the writes of translations that finish in a moment. With the bound, a translation slower than it can still lose a
+    // memory write (its writes are not known before it is translated): so it is opt-in until it has been tested on more
+    // machines. A target made this frame still waits it out. A value that is not a number is ignored with a warning.
+    static const double translate_wait_ms = [] {
+        double ms = translate_wait::kOff;
+        const char* e = getenv("RX_VK_TRANSLATE_WAIT_MS");
+        if (e && !translate_wait::parse(e, ms)) {
+            ms = translate_wait::kOff;
+            logf("vk: RX_VK_TRANSLATE_WAIT_MS=%s is not a number of milliseconds: ignored", e);
+        }
+        if (e && ms >= 0)
+            logf("vk: a shader still translating is waited for at most %.1f ms a frame on each recording thread, then its draws "
+                 "on earlier frames' targets are left out (RX_VK_TRANSLATE_WAIT_MS)", ms);
+        else if (e)
+            logf("vk: shaders still translating are waited out (RX_VK_TRANSLATE_WAIT_MS off)");
+        return ms;
+    }();
     if (!cp->ready.load(std::memory_order_acquire)) {
         if (legacy_translation_skip && targets_persistent(at)) return use.skipped(), void(st_pending_skips++);
-        wait_for(cp->ready);
+        if (!always_wait && translate_wait_ms >= 0 && targets_persistent(at)) {
+            static thread_local uint64_t budget_frame = ~0ull;
+            static thread_local double budget_left = 0;
+            const uint64_t frame = texture_frame_no();
+            if (frame != budget_frame) budget_frame = frame, budget_left = translate_wait_ms;
+            bool ready;
+            if (budget_left > 0) {   // (counted as a wait only when it can wait: the stat #1573 was judged on stays honest)
+                PROF_EXACT();
+                const auto t0 = std::chrono::steady_clock::now();
+                ready = jobs_wait_for(cp->ready, budget_left);
+                const double took = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                budget_left -= took;
+                st_waits++;
+                st_wait_ms += took;
+            } else {
+                ready = cp->ready.load(std::memory_order_acquire);
+            }
+            if (!ready) return use.skipped(), void(st_pending_skips++);
+        } else {
+            wait_for(cp->ready);
+        }
     }
     if (exposure_log_on() && cp) exposure_note(s, *cp);
     if (cp->failed) SKIP_HERE();
@@ -8092,6 +8161,11 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background, b
     PreparedFor prepared_for;
     double hash_ms = 0;
     const PrepareWhy why = prepare_check(path, seed_path(), program_cache_stamp(), &prepared_for, &hash_ms);
+    // (hookshot) the pipeline cache's files dropped at this start (pcache_drop_stale: another translator's, or a folder from
+    // before the stamp file) took the stage libraries the warm pass had kept in them: made again, whatever the record says,
+    // once a run, by the start's own preparation (the background one in play leaves the driver's part to first use)
+    static std::atomic<bool> rewarm_once{true};
+    if (!background && pcache_drop_stale() && rewarm_once.exchange(false)) prepared_for.warmed = 0;   // (read as not made)
     const bool libraries = gpl_wanted() && !env_on("RX_VK_NO_WARM");
     const uint64_t warmed = warmed_stamp(libraries);
     const std::string warming = path + ".warming";
