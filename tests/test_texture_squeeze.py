@@ -27,6 +27,9 @@ def main():
     if "used <= allowed" not in held:
         raise SystemExit("the 97% squeeze waits for room in VMA's blocks even past the driver's allowance, where the driver "
                          "pages VRAM out to system memory (#2156: 7602 MB used of 6982, 14-25 fps)")
+    if "!(kept_only && !squeeze_always)" not in squeeze:
+        raise SystemExit("the 97% squeeze runs while the textures' pool is down to its blocks made at the start, past the "
+                         "allowance too, where no eviction can bring the count down (#2711)")
     if 'env_on("RX_VK_SQUEEZE_ALWAYS")' not in tex:
         raise SystemExit("RX_VK_SQUEEZE_ALWAYS=1 does not bring the old squeeze back")
     if "room in the blocks: not squeezed" not in tex:
