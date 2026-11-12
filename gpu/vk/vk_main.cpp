@@ -274,7 +274,17 @@ bool create_device() {
         if (const char* e = getenv("RX_VK_FORCE_MESH_FALLBACK")) v = atoi(e) != 0 ? 2 : v;
         return v >= 0 && v <= 2 ? v : 0;
     }();
-    if (mesh_mode == 2) dev.mesh_shader = false;
+    // (hookshot, issue 2245) RADV's native task/mesh path deadlocks the GPU: the gfx ring and RADV's gang compute ring
+    // end up waiting on each other, and a mesh-only draw hangs with the compute queue empty (devcoredumps on an
+    // RX 6800: no VM fault; waves stuck on gfx in the second). Task + mesh draws alone on the fallback still crash, so
+    // only full Compute is stable there, and the reports span Navi 2x (RX 6800, RX 6600 XT) and the RDNA3 APUs (Steam
+    // Deck OLED, Rog Xbox Ally X). On Linux, where AMD's Vulkan driver is RADV, Automatic picks Compute; Native stays
+    // a choice in the row. RDNA1 and older have no mesh shaders on RADV: for them a no-op.
+    int mesh_mode_used = mesh_mode;
+#ifndef _WIN32
+    if (mesh_mode_used == 0 && dev.props.vendorID == 0x1002) mesh_mode_used = 2;   // (Linux AMD is RADV)
+#endif
+    if (mesh_mode_used == 2) dev.mesh_shader = false;
     else optional(VK_EXT_MESH_SHADER_EXTENSION_NAME, dev.mesh_shader);
     optional(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME, dev.external_memory_host);
     optional(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, dev.external_memory_fd);   // (guest memory as udmabufs: vk_memory.cpp import_dma_buf)
@@ -600,6 +610,17 @@ bool create_device() {
 
 } // namespace
 
+std::string device_report_text() {
+    if (!dev.physical) return "";
+    VkPhysicalDeviceDriverProperties drv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    p2.pNext = &drv;
+    vkGetPhysicalDeviceProperties2(dev.physical, &p2);
+    // (driverName and driverInfo: "NVIDIA" "580.95.05", "radv" "Mesa 25.2.4", "Intel Corporation" "101.6130")
+    std::string text = std::string(p2.properties.deviceName) + ", " + drv.driverName;
+    if (drv.driverInfo[0]) text += std::string(" ") + drv.driverInfo;
+    return text;
+}
 /// (hookshot) The UNORM format of an sRGB one (the same bytes, read and written as they are), else the format itself
 VkFormat unorm_of(VkFormat f) {
     switch (f) {
@@ -638,10 +659,13 @@ void swap_views_make(VkImageUsageFlags usage, VkFormat format) {
 int swapchain_framegen() { return opts.framegen >= 2 ? std::min(opts.framegen, 4) : 0; }
 
 /// (hookshot) Whether the swapchain is made for NVIDIA DLSS Frame Generation: a fixed multiplier, and DLSS-G making the sets
-/// (vk_dlss.cpp dlss_fg_runs: asked for, on a device it runs on). V-Sync Auto is FIFO for it, where it was measured; the
-/// renderer's own methods and other GPUs keep Auto's mailbox (or immediate). present_image makes the swapchain again when it
-/// changes
-bool swapchain_dlssg() { return swapchain_framegen() >= 2 && dlss_fg_runs(); }
+/// (vk_dlss.cpp dlss_fg_runs: asked for, on a device it runs on, its runtime making as many frames as the multiplier asks).
+/// V-Sync Auto is FIFO for it, where it was measured; the renderer's own methods and other GPUs keep Auto's mailbox (or
+/// immediate), and so does DLSS-G asked for more frames than its runtime makes, which the renderer's own then makes.
+/// present_image makes the swapchain again when it changes: NGX's answer comes at the first present with a multiplier, so a
+/// swapchain made for DLSS-G before it is made once more without. (The set's made frames are the row's multiplier less 1, up
+/// to 8x: swapchain_framegen stops at 4, for the images)
+bool swapchain_dlssg() { return swapchain_framegen() >= 2 && dlss_fg_runs(opts.framegen - 1); }
 
 void retire_swapchain() {
     if (!dev.swapchain) return;
@@ -758,9 +782,13 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     // (hookshot) V-Sync Auto with DLSS Frame Generation at 2x and up: FIFO. Mailbox, NVIDIA's Fast Sync, puts the made frames on
     // the refresh grid whenever they come slower than the display (DLSS Frame Gen 3x: ~135 shown on a 165 Hz screen), so evenly
     // timed presents still reached the screen unevenly; FIFO on a VRR display shows each one when it is presented. Only where
-    // that was measured (swapchain_dlssg): the renderer's own frame generation and other GPUs keep Auto as it was
+    // that was measured (swapchain_dlssg): the renderer's own frame generation and other GPUs keep Auto as it was, also when
+    // DLSS-G is asked for but the renderer's own makes the frames (a multiplier over what its runtime makes, or given up)
     const bool fg_fifo = vsync == 0 && swapchain_dlssg();
     if (fg_fifo) logf("vk: V-Sync Auto with DLSS Frame Generation at %dx: FIFO", swapchain_framegen());
+    else if (vsync == 0 && swapchain_framegen() >= 2 && dlss_fg_wanted() && dlss_why() == DLSS_OK)
+        logf("vk: V-Sync Auto with frame generation at %dx, its frames the renderer's own (DLSS-G does not make them): Auto's "
+             "mode, as without DLSS-G", opts.framegen);
     if (vsync != 1) {
         if (!fg_fifo)
             for (auto m : modes)
