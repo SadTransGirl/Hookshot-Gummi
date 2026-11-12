@@ -30,6 +30,7 @@
 #include "vk_texture.h"   // (upload_command_buffer)
 #include "vk_gprof.h"      // (RX_VK_PASS_TIMING)
 #include "import_hold.h"
+#include "wb_learn.h"
 #include "mirror_inherit.h"
 #include "retired_give_back.h"
 #ifdef __linux__
@@ -2621,6 +2622,7 @@ void mirror_sync(Pool& p) {
     std::map<VkBuffer, std::vector<VkBufferCopy>> cap_runs;   // (from the captures' copies)
     uint64_t run_lo = 0, run_hi = 0;
     const uint64_t end_page = (p.hi + 4095) >> kPageShift;
+    const bool note_writes = memory_wb_followed(p.lo, p.hi);   // (wb_learn.h: once a pool, not a page)
     for (uint64_t page = p.lo >> kPageShift; page < end_page;) {
         if (region_gen[page / kRegionPages] <= p.synced_gen) {   // (a clean 2 MB region, or its rest when the pool starts in it)
             page = std::min(end_page, (page / kRegionPages + 1) * kRegionPages);
@@ -2639,6 +2641,9 @@ void mirror_sync(Pool& p) {
                      "pool synced at %u, gen now %u)", (unsigned long long)(page << kPageShift), (unsigned long long)p.lo,
                      live ? "live" : "from a capture", pg, (unsigned)p.synced_gen, gen_now);
         }
+        // (hookshot) the CPU wrote this page: in a large binding whose write-back may be left out, the copy below would bring
+        // guest memory's stale rest of the page over the GPU's: that binding is written back from now on (wb_learn.h)
+        if (dirty && note_writes) memory_note_cpu_access(page << kPageShift, 1ull << kPageShift, true);
         if (dirty && protect_bare_on() && prot_page_since(page, p.synced_gen)) {   // (the GPU's records kept: see prot_pages)
             st_prot_kept++;
             page++;
@@ -2701,6 +2706,95 @@ void mirror_sync(Pool& p) {
 }
 
 } // namespace
+
+// ---- (hookshot) Large written bindings the CPU does not read: no write-back (RX_VK_WB_MAX_KB, wb_learn.h) ----
+// The table is fed from the bindings (wb_leave_out, the replay's threads, pools_mu held), the CPU's reads (memory_note_cpu_read,
+// invalidate on the game's threads) and the CPU's writes that a mirror sync copies (mirror_sync); its own mutex, taken last.
+// RX_VK_WB_MAX_KB=<KB>: the size from which a binding may be left out (unset or 0: every written binding written back, the
+// default); RX_VK_WB_PROBATION=<submissions>: how many submissions write it whole before it is (8)
+std::mutex wb_learn_mu;
+wb_learn::Table wb_table;
+int64_t st_wb_left, st_wb_left_bytes, st_wb_stale;
+uint64_t wb_cap() {
+    static const uint64_t v = [] {
+        const uint64_t b = wb_learn::max_bytes(getenv("RX_VK_WB_MAX_KB"));
+        wb_table.probation = (uint32_t)std::max(1, env_int("RX_VK_WB_PROBATION", (int)wb_table.probation));
+        if (b) logf("vk: written bindings over %llu KB are written back only where the CPU reads or writes them, after %u submissions "
+                    "whole (RX_VK_WB_MAX_KB)", (unsigned long long)(b >> 10), wb_table.probation);
+        return b;
+    }();
+    return v;
+}
+// (a written binding [lo, hi): false, write it all back; true, only the guest ranges in keep, the parts the CPU has touched)
+bool wb_leave_out(uint64_t lo, uint64_t hi, std::vector<std::pair<uint64_t, uint64_t>>& keep) {
+    if (!wb_cap()) return false;
+    std::lock_guard lk(wb_learn_mu);
+    if (!wb_table.plan(lo, hi, wb_cap(), mirror_epoch, keep)) return false;   // (mirror_epoch: the submission)
+    uint64_t kept = 0;
+    for (const auto& k : keep) kept += k.second - k.first;
+    st_wb_left++, st_wb_left_bytes += (int64_t)(hi - lo - kept);
+    return true;
+}
+void memory_note_cpu_access(uint64_t guest, uint64_t size, bool write) {
+    if (!size || !wb_cap()) return;
+    bool stale;
+    {
+        std::lock_guard lk(wb_learn_mu);
+        // (only in a large binding followed: the CPU's other reads and writes, all over memory, would only fill the table)
+        if (!wb_table.followed(guest, guest + size)) return;
+        stale = wb_table.read(guest, guest + size);
+        if (stale) st_wb_stale++;
+    }
+    static std::atomic<int> told{0};
+    if (stale && told++ < 20)
+        logf("vk: the CPU %s %#llx +%#llx, in a binding whose write-back was left out: written back from now on (RX_VK_WB_MAX_KB=0: "
+             "every one)", write ? "wrote" : "read", (unsigned long long)guest, (unsigned long long)size);
+}
+void memory_note_cpu_read(uint64_t guest, uint64_t size) { memory_note_cpu_access(guest, size, false); }
+bool memory_wb_followed(uint64_t lo, uint64_t hi) {
+    if (!wb_cap()) return false;
+    std::lock_guard lk(wb_learn_mu);
+    return wb_table.followed(lo, hi);
+}
+static void wb_learn_report() {   // (memory_end_submission, every 600 submits)
+    if (!wb_cap()) return;
+    std::lock_guard lk(wb_learn_mu);
+    logf("vk: write-backs left out (600 submits): %lld, %.1f MB; %zu bindings followed, %zu ranges the CPU read, %llu resets; CPU reads "
+         "or writes of one left out: %lld so far", (long long)st_wb_left, st_wb_left_bytes / 1048576.0, wb_table.seen(), wb_table.reads(),
+         (unsigned long long)wb_table.resets(), (long long)st_wb_stale);
+    st_wb_left = st_wb_left_bytes = 0;
+}
+// (hookshot, diagnostics) RX_VK_LOG_WB_SKIPS=1: the written bindings left out, by guest range, every 600 submits
+struct WbSkip { uint64_t hi, n, bytes; };
+std::mutex wb_skips_mu;
+std::map<uint64_t, WbSkip> wb_skips;   // (by guest start)
+static bool wb_skips_log() {
+    static const bool v = env_on("RX_VK_LOG_WB_SKIPS");
+    return v;
+}
+static void wb_skip_note(uint64_t lo, uint64_t hi) {
+    std::lock_guard lk(wb_skips_mu);
+    WbSkip& s = wb_skips[lo];
+    s.hi = std::max(s.hi, hi), s.n++, s.bytes += hi - lo;
+}
+static void wb_skips_report() {
+    std::vector<std::pair<uint64_t, uint64_t>> top;   // (bytes, lo)
+    uint64_t all = 0;
+    std::lock_guard lk(wb_skips_mu);
+    for (const auto& [lo, s] : wb_skips) top.push_back({s.bytes, lo}), all += s.bytes;
+    std::sort(top.rbegin(), top.rend());
+    std::string t;
+    for (size_t i = 0; i < top.size() && i < 12; i++) {
+        const WbSkip& s = wb_skips[top[i].second];
+        char b[112];
+        snprintf(b, sizeof b, " %#llx+%#llx: %llu, %.1f MB;", (unsigned long long)top[i].second,
+                 (unsigned long long)(s.hi - top[i].second), (unsigned long long)s.n, s.bytes / 1048576.0);
+        t += b;
+    }
+    logf("vk: write-backs skipped (RX_VK_WB_MAX_KB, 600 submits): %zu ranges, %.1f MB; the largest:%s", wb_skips.size(),
+         all / 1048576.0, t.c_str());
+    for (auto& kv : wb_skips) kv.second.bytes = 0, kv.second.n = 0;
+}
 
 // ---- (from PR 430, YunaraDebugs) Readback pages: GPU results the CPU reads (invalidate) and then writes, as OoT's exposure meter (a
 // sum the GPU adds into each frame; the CPU reads it and stores 0 back). On the console the GPU adds into that memory as it is when
@@ -3075,19 +3169,18 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     if (p->synced_epoch != mirror_epoch || p->sync_seg > texture_segment()) mirror_sync(*p);
     if (written) {
         p->gpu_written = true;   // (its mirror kept: mirrors_give_back)
-        // (hookshot, 11-10) RX_VK_WB_MAX_KB=<KB>: bindings larger than that do not queue a write-back. OoT writes
-        // tens of MB of culling lists and per-frame buffers through the GPU that the CPU never reads; copying them
-        // back was most of a submit's memory sync (issue 384: 68 MB a frame, 7 ms of the GPU's time, and
-        // RX_VK_NO_WRITEBACK took an RTX 4080 from 45 to 57 fps). Small results the CPU does read (the exposure
-        // meter and the like) stay copied. 0 or unset: every written binding, as before.
-        static const uint64_t wb_max = [] {
-            const char* e = getenv("RX_VK_WB_MAX_KB");
-            const uint64_t kb = e ? (uint64_t)std::max(0, atoi(e)) : 0;
-            if (kb) logf("vk: write-backs only of written bindings up to %llu KB (RX_VK_WB_MAX_KB)", (unsigned long long)kb);
-            return kb << 10;
-        }();
-        if (!wb_max || size <= wb_max)
-            writebacks.push_back({p, off, std::min(off + size, p->hi - p->lo)});
+        // (hookshot) a binding over RX_VK_WB_MAX_KB (off unless set; 1024 is the tested size) that the CPU has not read through its
+        // probation queues no write-back: OoT writes tens of MB of culling lists and per-frame buffers through the GPU that
+        // the CPU never reads, and copying them back was most of a submit's memory sync (issue 384: 68 MB a frame; Hyrule
+        // Field on an RTX 3060 Ti, 68 -> 18 MB written back a frame). Learned, not a plain size cap: the CPU does read
+        // some large ones (wb_learn.h)
+        const uint64_t wlo = p->lo + off, whi = p->lo + std::min(off + size, p->hi - p->lo);
+        static thread_local std::vector<std::pair<uint64_t, uint64_t>> keep;
+        if (!wb_leave_out(wlo, whi, keep)) writebacks.push_back({p, off, whi - p->lo});
+        else {
+            for (const auto& [klo, khi] : keep) writebacks.push_back({p, klo - p->lo, khi - p->lo});
+            if (wb_skips_log()) wb_skip_note(wlo, whi);
+        }
         rb_hazard_locked(p->lo + off, p->lo + std::min(off + size, p->hi - p->lo));   // (memory_rb_refresh)
     }
     return remember({p->mirror, off, size, 0});
@@ -3931,6 +4024,8 @@ void memory_end_submission(VkCommandBuffer cmd, uint64_t part) {
     {   // (every 600 submissions: how the mirror syncs' dirty pages were read)
         static int64_t n, l_live, l_cap;
         if (++n % 600 == 0) {
+            wb_learn_report();
+            if (wb_skips_log()) wb_skips_report();
             static int64_t l_old;
             logf("vk: mirror syncs (600 submits): %lld dirty pages from their submits' captures, %lld from earlier ones', "
                  "%lld from guest memory as it was at the replay; %zu captures kept; %lld pages the GPU wrote copied over "
