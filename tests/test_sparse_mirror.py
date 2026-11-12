@@ -63,7 +63,7 @@ def check_source():
     rel = block(mem, "void sparse_release() {")
     need(rel, ["guest_pages_set(a, e, p.address + (a - p.lo))", "dead_blocks.push_back(",
                "std::max(mem_rec_value, p.last_value)", "|| p.wanted[i]",
-               "if (mirror_epoch - p.dead_since[i] < kSparseIdleEpochs) continue;", "mirror_epoch - last_bound_of(p, i) < kSparseIdleEpochs",
+               "if (mirror_epoch - p.block_dead_since[i] < kSparseIdleEpochs) continue;", "mirror_epoch - last_bound_of(p, i) < kSparseIdleEpochs",
                "p.released[i] = p.blocks[i];"], "sparse_release()")
     need(block(mem, "void sparse_reap() {"), ["dead_blocks.front().value <= mem_completed", "sparse_live.count(d.buffer)",
                                               "d.pool->release_gen[d.index] != d.gen", "sparse_bind_infos(infos, &unbound);", "free_sparse_block("], "sparse_reap()")
