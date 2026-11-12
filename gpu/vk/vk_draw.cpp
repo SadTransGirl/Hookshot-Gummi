@@ -1331,6 +1331,10 @@ std::string pipe_notes_path() {
 /// What adds notes without building them (state_list_prepare) removes it; a note play adds was built by play, into its cache
 std::string precompile_built_path() { return pipe_notes_path() + ".built"; }
 void precompile_built_write(size_t notes) {
+    // (not by a --prepare-shaders run: on NVIDIA the pipeline cache that process writes does not answer the play process
+    // ("kept 0 of 32"), so the first play after a preparation found none of the noted pipelines in a cache and compiled them
+    // in play with draws left out. Left unwritten, the first play start builds them itself, and its cache does answer)
+    if (env_on("HOOKSHOT_PREPARE_ONLY")) return;
     if (FILE* f = fopen(precompile_built_path().c_str(), "wb")) {
         const uint64_t rec[2] = {program_cache_stamp(), (uint64_t)notes};
         fwrite(rec, 8, 2, f);
@@ -8429,15 +8433,49 @@ void precompile_warm(void (*progress)(size_t done, size_t total)) {
         if (progress) progress(done.load(), total);
         prepare_progress_log("noted pipelines", done.load(), total, t0, log_at);
     });
-    if (done == total && !prepare_stopped()) {
+    // (the compute pipelines too, every kept compute program's: a first start in start mode makes them all, and a load at a
+    // create call only asks the caches, so on a new install a first dispatch found none (666 in one first session). Built
+    // into the cache and let go, as the noted ones)
+    const std::vector<uint64_t> computes = done == total && !prepare_stopped() ? program_cache_compute_keys() : std::vector<uint64_t>{};
+    std::atomic<size_t> computes_done{0}, computes_built{0}, computes_failed{0};
+    const auto c0 = std::chrono::steady_clock::now();
+    warm_bounded::run(computes.size(), threads, [&](size_t i) {
+        static thread_local bool off = (ub_thread_off(), true);
+        (void)off;
+        program_cache_borrow(computes[i], [&](Program& p) {
+            if (!p.compute || p.failed || p.stages.empty() || !p.stages[0].module || prepare_stopped() || taau_key(p.key)) return;
+            ensure_layout(p);
+            const VkComputePipelineCreateInfo ci = compute_pipeline_info(p, true);   // (as a dispatch and a load ask for it)
+            VkPipeline made = VK_NULL_HANDLE;
+            if (cached_compute(&ci, &made) == VK_SUCCESS && made) {
+                vkDestroyPipeline(dev.device, made, nullptr);
+                computes_built++;
+            } else {
+                computes_failed++;
+            }
+        });
+        computes_done++;
+    }, [] { return prepare_stopped(); }, [&](size_t) {
+        if (progress) progress(total, total);
+        prepare_progress_log("compute pipelines", computes_done.load(), computes.size(), c0, log_at);
+    });
+    const bool all = done == total && computes_done == computes.size();
+    static const bool prepare_only = env_on("HOOKSHOT_PREPARE_ONLY");   // (a --prepare-shaders run: vk_main.cpp)
+    if (all && !prepare_stopped()) {
         pipeline_cache_save(true);   // (in the file before the marker says they are there)
-        precompile_built_write(total);
+        // (not by the preparation's own process: warm_bounded.h leaves_marker)
+        if (warm_bounded::leaves_marker(prepare_only, all, prepare_stopped())) precompile_built_write(total);
         remove(warming.c_str());
     }
-    logf("vk: precompile: %zu noted pipelines of %zu programs built into the pipeline cache and let go (%zu not made, %zu whose "
-         "program variant is not kept), on %u threads in %.1f s%s", built.load(), progs.size(), failed.load(), no_program.load(),
-         threads, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
-         done == total && !prepare_stopped() ? "" : "; stopped before the end: the next start goes on");
+    logf("vk: precompile: %zu noted pipelines of %zu programs and %zu compute pipelines of %zu compute programs built into the "
+         "pipeline cache and let go (%zu and %zu not made, %zu whose program variant is not kept), on %u threads in %.1f s (the "
+         "compute ones %.1f s)%s", built.load(), progs.size(), computes_built.load(), computes.size(), failed.load(),
+         computes_failed.load(), no_program.load(), threads,
+         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+         std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count(),
+         !all || prepare_stopped() ? "; stopped before the end: the next start goes on"
+         : prepare_only ? "; the preparation's own process: the first start of the game builds them again, from the driver's "
+                          "cache, into the cache it then loads from" : "");
 }
 
 /// (hookshot, RX_VK_LOAD=create) The start with nothing kept ready by a list: each note is only found, by its place in the file,
@@ -8519,9 +8557,13 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
     // caches alone never meets a pipeline the prepare should have compiled. The first start after a preparation builds them
     // there and lets each go, precompile_warm: before the game, and never more of them alive than workers)
     if (programs_load_at_create()) {
+        // (the pipeline cache's files dropped at this start, pcache_drop_stale: what the marker says is in them is gone)
+        if (pcache_drop_stale()) remove(precompile_built_path().c_str());
         if (!precompile_covers_notes()) precompile_warm(progress);
         if (precompile_covers_notes()) return precompile_at_create();
-        if (prepare_stopped()) return;   // (the window was closed in it)
+        // (the window was closed in it; or this is the preparation's own process, which leaves no marker: its warm filled
+        // the driver's cache, the first start of the game warms again and loads at create calls from then on)
+        if (prepare_stopped() || env_on("HOOKSHOT_PREPARE_ONLY")) return;
     }
     const auto t0 = std::chrono::steady_clock::now();
     // (a start that dies in here would die in here every time, the notes being what it builds from: a player saw the console reach

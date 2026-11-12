@@ -745,6 +745,15 @@ std::unordered_set<uint64_t> program_cache_kept_keys() {
         if (!kv.second.empty()) keys.insert(kv.first);
     return keys;
 }
+std::vector<uint64_t> program_cache_compute_keys() {
+    disk_init();
+    std::vector<uint64_t> keys;
+    if (!disk_on) return keys;
+    std::lock_guard lk(disk_mu);
+    for (const auto& kv : disk_records)
+        if (!kv.second.empty() && (kv.second[0].kind & 1)) keys.push_back(kv.first);
+    return keys;
+}
 std::string program_cache_path() {
     disk_init();
     return disk_on ? disk_path : std::string();
