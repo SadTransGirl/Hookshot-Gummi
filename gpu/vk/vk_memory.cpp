@@ -101,6 +101,7 @@ struct Pool {
     VmaAllocation shadow_alloc = nullptr;
     VkDeviceAddress shadow_address = 0;
     std::vector<uint64_t> shadow_known;   // (a bit a page)
+    bool shadow_wanted = false;   // (its write-back was worth one: one given back under VRAM pressure is made again)
 };
 uint64_t mem_rec_value = 0, mem_completed = 0;   // (the recording being made, and the GPU's progress)
 
@@ -1896,6 +1897,11 @@ void memory_recording_value(uint64_t value, uint64_t completed) {
     mem_rec_value = value;
     if (completed > mem_completed) mem_completed = completed;
 }
+/// (hookshot, RX_VK_FRAME_TRACE) The time the replay has waited for the GPU in take_capture, for the pages a submission still
+/// on the GPU writes back: part of the trace's memsync_ms, and the part that is a wait. Frames of 36-201 ms of memory sync in a
+/// played session could not be told from a slow copy
+std::atomic<int64_t> st_late_wait_ns{0};
+int64_t memory_late_wait_ns() { return st_late_wait_ns.load(std::memory_order_relaxed); }
 bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed) {
     const auto tk0 = std::chrono::steady_clock::now();
     if (c->late_value && c->map) {   // (the pages a submission still on the GPU writes back: see capture_make)
@@ -1905,6 +1911,8 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
         const auto tw = std::chrono::steady_clock::now();
         vk_timeline_wait(c->late_value);
         st_tk_late += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw).count();
+        st_late_wait_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tw).count(),
+                                  std::memory_order_relaxed);   // (hookshot: the frame trace's late_wait_ms)
         st_tk_late_n++;
         uint8_t* const base = (uint8_t*)host->guest_base();
         for (uint32_t i : c->late)
@@ -3879,14 +3887,34 @@ bool shadow_make(Pool& p) {
              (unsigned long long)(n >> 20), (unsigned long long)(shadow_bytes >> 20));
     return true;
 }
-// (pools_mu held) every shadow given back while VRAM is really 95% full, or the driver's count at 99% (every 120 write-back
-// submissions): made again when there is room
+// (pools_mu held) every 120 write-back submissions: every shadow given back while VRAM is really 95% full, or the driver's count
+// at 99%, and the shadows of the pools that had one made again once there is room. A pool's own write-backs may each stay under
+// the 256 KB a shadow is first made at, for good after a scene change, so waiting for one never gave it its shadow back: in a
+// player's log (issue 2238) 48 of 352 MB stayed whole copies for the rest of the session while the others were made again.
 void shadows_check_room() {
     static int64_t n;
-    if (!shadow_bytes || ++n % 120) return;
+    if (++n % 120) return;
+    bool wanted = false;
+    for (const auto& [lo, p] : imported) wanted = wanted || (p.shadow_wanted && !p.shadow && p.mirror);
+    if (!shadow_bytes && !wanted) return;
     uint64_t used = 0, allowed = 0, block_free = 0;
     if (!vram_usage(&used, &allowed, &block_free) || !allowed) return;
-    if (shadow_rules_raw() ? used <= allowed / 100 * 95 : !vram_pressure::shadows_go(used, allowed, block_free)) return;
+    if (!(shadow_rules_raw() ? used > allowed / 100 * 95 : vram_pressure::shadows_go(used, allowed, block_free))) {
+        int made = 0, tries = 0;
+        uint64_t made_bytes = 0;   // (what this check made, not what all the shadows are)
+        for (auto& [lo, p] : imported) {
+            if (!p.mirror || p.shadow || !p.shadow_wanted) continue;   // (mirror_free'd: cannot be made again, not a try)
+            const uint64_t n = p.hi - p.lo;
+            if (!shadow_room(n)) continue;   // (too big to fit now, or past the budget: no attempt, a later check has room)
+            if (tries++ == 8) break;         // (hard cap on attempts per check: each is an allocation of the pool's whole size)
+            if (shadow_make(p)) made++, made_bytes += n;
+        }
+        static int logged;
+        if (made && logged++ < 8)
+            logf("vk: write-back diff: %d shadows made again (%llu MB)", made, (unsigned long long)(made_bytes >> 20));
+        return;
+    }
+    if (!shadow_bytes) return;
     const uint64_t had = shadow_bytes;
     for (auto& [lo, p] : imported) shadow_free(p);
     for (auto& nh : retired_pools) shadow_free(nh.mapped());
@@ -4262,7 +4290,11 @@ void memory_end_submission(VkCommandBuffer cmd, uint64_t part) {
             checkpoint_mark(cmd, p->lo, 'b');
             uint64_t run_bytes = 0;
             for (const VkBufferCopy& r : runs) run_bytes += r.size;
-            if (diff && !p->shadow && run_bytes >= (256u << 10)) shadow_make(*p);   // (a pool whose write-back is worth one, as VRAM allows)
+            if (diff && !p->shadow && run_bytes >= (256u << 10)) {
+                // (a pool whose write-back is worth one, as VRAM allows; wanted stays after VRAM takes it, for shadows_check_room)
+                p->shadow_wanted = true;
+                shadow_make(*p);
+            }
             if (diff && p->shadow && p->address && p->mirror) {
                 VkBufferDeviceAddressInfo mda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
                 mda.buffer = p->mirror;
