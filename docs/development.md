@@ -153,6 +153,7 @@ case-sensitive, and an unknown one is ignored.
 | `RX_VK_PRESENT_AHEAD=0` | Frame generation's copies into the window submitted each at its own time, as before #1702 (default on: a set's copies go to the GPU together). Not `RX_VK_PRESENTS_AHEAD` |
 | `RX_VK_PASS_TIMING=1` or `2` | GPU time per pass (2: per program too), logged every 600 presents |
 | `RX_VK_SLOW_LOG=<ms>` | The replay's times for each frame that took longer than this |
+| `RX_VK_LOG_PROGRAM_LIFE=1` | The programs' life: a log line at each program the game makes (its shaders set) or frees and at each program's first draw or dispatch (what it needed: a program read from the cache, a translation, a pipeline from a cache or compiled, left out, and how long after its create call), and a `program census` line every 600 presents |
 | `RX_VK_PRESENT_THREAD=1` | On (off by default: the game's thread presents). Where the device has a second queue that can present to the window (a second queue of the replay's family, else a compute family's): each present is made on a thread and queue of its own once the frame's copy into the window is done, and the game's thread goes on at once (with NVIDIA's driver on Wayland the present otherwise waits ~2.4 ms a frame for the GPU there). One present out at most; under V-Sync On (FIFO) with `VK_KHR_present_wait`, until it is shown. The log has the fence's and the present's time (and how long after it the frame was shown) every 600 presents |
 | `HOS_PGO=<file>` | In a run of an `RX_PGO=gen` build: `<file>.reset` clears the counters, `<file>.dump` writes them to `<file>`. It is read before `hookshot_env.txt`, so set it in the environment |
 
@@ -167,6 +168,8 @@ case-sensitive, and an unknown one is ignored.
 | `RX_VK_NOOPT` (set) | Pipelines built without the driver's optimisations |
 | `RX_VK_SKIP_PROG=<prefix>,...` | Leaves out the draws of these programs (default `53509044401d78d2`; `-` leaves out none) |
 | `RX_VK_PIPE_SKIP=0`, `1` or `2` | Default/`1`: wait for shader translation; a pending pipeline can be skipped only for attachment-only draws whose targets hold an earlier frame. `0`: wait for every pipeline too. `2`: restore the old skip for untranslated draws with persistent targets; this can omit writes before the shader is known. Translated memory-writing draws still wait |
+| `RX_VK_LOAD=create` or `start` | When programs and their pipelines are loaded from what the preparation kept. Without the switch: `create` where the GPU has mesh shaders, `start` where it draws mesh programs through the compute fallback; and `start` on an install where a session's first uses waited for loads for over 100 ms at once or 500 ms in all (`hookshot_load_start.txt` in the game folder, removed by a preparation or by hand). With the compressed program cache (`RX_VK_PROGRAM_CACHE_ZSTD=1`) always `start`, whatever this switch says: its records are only read whole. The log says which and why. `start`: every listed one before the title, as before. `create`: none by a list; each program's kept variants and noted pipelines are loaded by a background job when the game makes the program (from the caches only: never a translation or a compile there), and a first draw that comes before its job ran runs it itself. The first start after a preparation builds each noted pipeline into the pipeline cache once and lets it go (before the title, with the precompile's progress), and only then loads at create. `RX_VK_LOAD_WORKERS=<n>` (2): the jobs that run at once (0, to measure: none, a draw loads what it needs itself); `RX_VK_LOAD_UNLISTED=1`: programs no list has a pipeline of are loaded at their create call too (otherwise at their first draw, as with `start`); `RX_VK_LOAD_WORKERS_LOADING=<n>`: while no frame was presented for 100 ms (the same unless set) |
+| `RX_VK_MODULE_IDS=0` | Shader module identifiers off (`VK_EXT_shader_module_identifier`). With them a compute program's module is learned by its identifier when it is first made from its code (`hookshot_module_ids.bin`, for one program cache and one driver), and in a later run the load at the program's create call makes that variant's pipeline from the caches without reading its code or making a module; where no cache has the pipeline the code is read as before |
 | `RX_VK_PRECOMPILE=0` or `1` | The shader preparation before the title off or on (on in builds made with `RX_RELEASE=1`, as the builders' are) |
 | `RX_VK_TASK_MESH_FALLBACK=0` or `1` | Task + mesh draws through the compute fallback (1) or the driver's mesh shaders (0). By default the fallback is on for AMD's Navi 21 and Navi 22 on Windows (RX 6800, 6800 XT, 6900 XT, 6950 XT, 6700 XT), where the native path timed out the driver (issue 996) |
 | `RX_VK_FALLBACK_PHI_LIMIT=<n>` | RADV on GCN 1-4 cards (RX 400/500, R9 2xx/3xx/Fury): a mesh fallback compute stage with more than this many phis is not built and its draws are left out (default 50000; `0`: no limit; anything but decimal digits is ignored with a warning; the limit in use is logged). Its compiler did not finish the two biggest mesh programs (80,000 phis) and grew past 25 GB (`gpu/vk/fallback_size_policy.h`) |
@@ -285,6 +288,20 @@ record is a pipeline the game asked for: its shaders' hashes, the program varian
 vertex formats and draw state it was made with (`nx2/pipeline_states.py` has the layout). It holds no game code: a
 player's build turns the hashes back into shaders from their own `hookshot_shaders.bin`.
 
+A record can also name a compute program the game ran, by the hash of its shader alone (the record's kind says which;
+the file format is the same, and lists from before read as they did). The game writes one the first time a run
+dispatches a program. Every start keeps the pipelines of the listed compute programs ready before the title: the
+shipped list's, and the ones in the game folder's `hookshot_computes.bin`, which holds what this install's play has
+dispatched (the same programs its own state list names). Without a list entry, a program is loaded and its pipeline
+made at its first dispatch, and a dispatch whose pipeline takes more than 50 ms is skipped. The log's
+`precompile: compute programs` and `compute pipelines` lines say how many were listed, from where, and how many
+pipelines came from the caches or were compiled. A first start, before this install's play has dispatched anything,
+keeps every compute program the game has, as it did before the list named any: a program the list misses is then ready
+too, at the cost of that start's memory. `RX_VK_PRECOMPILE_COMPUTES=listed` keeps only the listed ones on a first
+start as well; `learned` leaves the shipped list's out, to compare; `all` keeps every one at every start and `none`
+keeps none. The game keeps every compute program a shipped list names and never drops one: the bound is
+`pipeline_states.py check`, which stops on a merged list that names more than `COMPUTE_MOST`, for someone to decide.
+
 `nx2/make_game.py` merges the sources at every build into the game folder's `hookshot_pipeline_states_shipped.bin`. It
 takes the tour's list first, then the contributed ones by name, and keeps each pipeline once. The same sources always
 give the same bytes, and the first start's shader preparation builds those pipelines before the title. Without them a
@@ -320,7 +337,9 @@ Players send theirs to issue #2034 with **Save my pipeline list** (the menu's De
 one runs with `--json`). It checks the list as `pipeline_states.py --check` does and writes
 `hookshot-pipelines-<date>.zip` to the Downloads folder with exactly two files, the list and `hookshot_pipeline_report.txt`
 (the issue's template filled in from the run or from the game folder's log and `hookshot_options.ini`), then copies the
-template, shows the folder and opens the issue; never with `HOS_HEADLESS`. `tests/test_pipeline_share.py` checks the zip,
+template, shows the folder and opens the issue; never with `HOS_HEADLESS`. The list is zipped as the game wrote it, compute
+records included (the report's `Pipelines` line counts them); `pipeline_states.py --check` and `add` take a sent list only
+when it is exactly a list (`read_sent`). `tests/test_pipeline_share.py` checks the zip,
 the template and the refusals for both. By hand: `python -I nx2/pipeline_share.py <game folder> [--out-dir <folder>]`.
 
 Refresh the tour's list before each release, and after a change to the shaders' translation or to the state a pipeline

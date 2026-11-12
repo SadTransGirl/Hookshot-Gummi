@@ -36,6 +36,7 @@
 #include "vk_texture.h"
 #include "vk_menu.h"
 #include "vk_draw.h"
+#include "vk_programs.h"
 #include "vk_gprof.h"
 #include "vk_dump.h"
 #include "vk_jobs.h"
@@ -2635,6 +2636,7 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
     {   // (an upload over 15 ms: what it was, 60 of them)
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - up0).count();
         static int slow_logged;
+        if (ms > 15.0) programs_slow_upload(ms, tex->width, tex->height, tex->nvn_format);   // (RX_VK_LOG_PROGRAM_LIFE=1)
         if (ms > 15.0 && slow_logged++ < 60) {
             uint64_t part = 0;
             if (partial) for (const auto& r : dirty) part += r.second - r.first;
