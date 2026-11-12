@@ -2093,7 +2093,7 @@ bool share_write(const std::string& path, const std::string& data) {
 }
 /// The template's values from this run: the version, the OS, the GPU and its driver, the output, the upscaler and the 3D's size,
 /// frame generation and HDR as the menu has them now, and the mods
-std::vector<std::string> share_values(long long pipelines, bool v2) {
+std::vector<std::string> share_values(long long pipelines, bool v2, long long computes) {
     std::vector<std::string> v(ps::kFieldCount);
     v[0] = HOOKSHOT_VERSION;
     v[1] = share_os() + "; " + dev.props.deviceName + ", driver " + driver_text();
@@ -2109,7 +2109,7 @@ std::vector<std::string> share_values(long long pipelines, bool v2) {
                                             [](char x, char y) { return tolower((unsigned char)x) < tolower((unsigned char)y); });
     });
     v[5] = ps::mods_text(mods);
-    v[7] = ps::pipelines_text(pipelines, v2);
+    v[7] = ps::pipelines_text(pipelines, v2, computes);
     return v;
 }
 /// Save my pipeline list: the zip, then the clipboard, the folder and the issue (share_said says what happened)
@@ -2124,7 +2124,7 @@ void share_pipeline_list() {
         logf("menu: Save my pipeline list: %s", why.c_str());
         return;
     }
-    const std::string lines = ps::template_lines(share_values(n, !list.compare(0, 8, "HKSTATE2")));
+    const std::string lines = ps::template_lines(share_values(n, !list.compare(0, 8, "HKSTATE2"), ps::compute_count(list)));
     const time_t now = time(nullptr);
     tm t{};
 #ifdef _WIN32
