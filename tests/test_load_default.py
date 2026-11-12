@@ -36,6 +36,9 @@ def check_source():
         body = cache[cache.index(head):]
         if leave not in body[:body.index("fread(")]:
             raise SystemExit("a compressed record could be read by its parts' places: " + head.split("(")[0])
+    replay = (ROOT / "gpu/vk/vk_replay.cpp").read_text(encoding="utf-8")
+    if "programs_frames_note(pskip, pwait_ms);" not in replay or "load_default::too_rough(left_out, pipeline_wait_ms)" not in progs:
+        raise SystemExit("draws left out and pipeline waits do not reach the safety net")
     if "load_default::choose(getenv(\"RX_VK_LOAD\")" not in progs or "load_default::too_slow(" not in progs:
         raise SystemExit("vk_programs.cpp does not use load_default.h's rule")
     draw = (ROOT / "gpu/vk/vk_draw.cpp").read_text(encoding="utf-8")

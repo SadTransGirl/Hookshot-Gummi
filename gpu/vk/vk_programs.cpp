@@ -424,6 +424,15 @@ void module_ids_on() {
     if (!off) ids_on.store(true, std::memory_order_release);
 }
 
+void programs_frames_note(long long left_out, double pipeline_wait_ms) {
+    if (!programs_load_at_create() || !load_default::too_rough(left_out, pipeline_wait_ms) || wait_marked.exchange(true)) return;
+    const bool wrote = load_default::marker_write_rough(load_fallback_path(), left_out, pipeline_wait_ms);
+    logf("vk: %lld draws and dispatches were left out in this session because their pipelines were not ready, and the game "
+         "waited %.0f ms for shaders or pipelines: over %lld or %.0f ms, so the next start loads every listed program before "
+         "the title again%s", left_out, pipeline_wait_ms, load_default::kLeftOutMost, load_default::kPipelineWaitMs,
+         wrote ? " (hookshot_load_start.txt)" : "; the marker did not write");
+}
+
 void programs_load_wait(uint64_t key) {
     if (!jobs_in_flight.load(std::memory_order_acquire)) return;
     std::shared_ptr<LoadJob> job;

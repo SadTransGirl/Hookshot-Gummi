@@ -32,6 +32,14 @@ inline Choice choose(const char* env, bool native_mesh, bool marker, bool compre
 constexpr double kWorstMs = 100.0, kTotalMs = 500.0;
 inline bool too_slow(double worst_ms, double total_ms) { return worst_ms > kWorstMs || total_ms > kTotalMs; }
 
+/// The other thing a session must not do: draw with pipelines that are not ready. Draws and dispatches left out because their
+/// pipeline was still being made, and the replay thread's waits for shaders or pipelines, over the session. Measured: 0 and
+/// 0 ms in every tour where the caches answered; 46,026 left out and 3.5 s of waits in three minutes of a first session whose
+/// loads found their pipelines in no cache. A few hundred can be an area no list covers, in either mode
+constexpr long long kLeftOutMost = 2000;
+constexpr double kPipelineWaitMs = 1000.0;
+inline bool too_rough(long long left_out, double pipeline_wait_ms) { return left_out > kLeftOutMost || pipeline_wait_ms > kPipelineWaitMs; }
+
 /// The marker a session that was too slow leaves for the next start (a preparation removes the file)
 inline bool marker_there(const std::string& path) {
     FILE* f = std::fopen(path.c_str(), "rb");
@@ -45,6 +53,15 @@ inline bool marker_write(const std::string& path, double worst_ms, double total_
     const bool ok = std::fprintf(f, "First uses of shader programs waited for their loads for %.0f ms in one session (the longest "
                                     "%.0f ms), so programs are loaded before the title again. Delete this file, or prepare the "
                                     "shaders again, to have them loaded when the game makes them.\n", total_ms, worst_ms) > 0;
+    return std::fclose(f) == 0 && ok;
+}
+inline bool marker_write_rough(const std::string& path, long long left_out, double pipeline_wait_ms) {
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) return false;
+    const bool ok = std::fprintf(f, "In one session %lld draws were left out because their pipelines were not ready, and the game "
+                                    "waited %.0f ms for shaders or pipelines, so programs are loaded before the title again. "
+                                    "Delete this file, or prepare the shaders again, to have them loaded when the game makes "
+                                    "them.\n", left_out, pipeline_wait_ms) > 0;
     return std::fclose(f) == 0 && ok;
 }
 
