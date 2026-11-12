@@ -3021,7 +3021,20 @@ bool readback_begin() {
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     return vkBeginCommandBuffer(rb_cmd, &bi) == VK_SUCCESS;
 }
+/// (hookshot, RX_VK_FRAME_TRACE) The time spent in a read-back's submit and wait for the GPU (the write-backs before an
+/// eviction, a flush to guest memory), and in texture_frame as a whole: neither was in any of the trace's columns. An area
+/// change had frames of 344 and 528 ms with every column near zero, the replay inside the driver in this wait for 317 ms
+std::atomic<int64_t> st_readback_wait_ns{0}, st_texture_frame_ns{0};
+struct TraceTimer {
+    std::atomic<int64_t>& into;
+    const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    ~TraceTimer() {
+        into.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(),
+                       std::memory_order_relaxed);
+    }
+};
 bool readback_submit_wait() {
+    const TraceTimer timed{st_readback_wait_ns};
     VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};   // (the copies' writes, for the host)
     b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
@@ -4058,7 +4071,11 @@ uint64_t preset_texture_budget(uint64_t preset_mb, bool preset_applies, bool vra
     return integrated ? std::min(b, own) : b;
 }
 
+int64_t texture_readback_wait_ns() { return st_readback_wait_ns.load(std::memory_order_relaxed); }
+int64_t texture_frame_ns() { return st_texture_frame_ns.load(std::memory_order_relaxed); }
+
 void texture_frame(uint64_t completed) {
+    const TraceTimer timed{st_texture_frame_ns};   // (hookshot: the frame trace's tex_frame_ms)
     upload_frame_report();
     frame_upload_ns.store(0, std::memory_order_relaxed);
     if (const int64_t d = st_deferred_frame.exchange(0, std::memory_order_relaxed)) {
