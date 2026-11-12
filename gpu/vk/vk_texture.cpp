@@ -3936,9 +3936,9 @@ void compact_step(uint64_t completed) {
         if (frame_no < compact.next_check) return;
         compact.next_check = frame_no + 120;
         static const uint64_t min_free = (uint64_t)(getenv("RX_VK_COMPACT_MB") ? std::max(1, atoi(getenv("RX_VK_COMPACT_MB"))) : 512) << 20;
-        uint64_t block_bytes = 0, free_bytes = 0;
-        if (!textures_pool_usage(&block_bytes, &free_bytes) ||
-            free_bytes < vram_compact::run_from(min_free, compact.pressed))
+        uint64_t block_bytes = 0, free_bytes = 0, kept = 0;   // (kept: the blocks made at the start, which no run gives back)
+        if (!textures_pool_usage(&block_bytes, &free_bytes, &kept) ||
+            vram_compact::returnable(block_bytes, free_bytes, kept) < vram_compact::run_from(min_free, compact.pressed))
             return;
         if (!image_compact_begin(64ull << 20, 12)) return;
         compact.runs++, compact.moved = compact.moved_bytes = compact.ignored = compact.passes = 0;
@@ -4279,13 +4279,16 @@ void texture_frame(uint64_t completed) {
     uint64_t hold_to = 0;    // (and what the hold's own line asks for, when the reserve's lower line set evict_to)
     // (hookshot, RX_VK_COMPACT) compacted, only the textures' pool's free space comes off the count: vram_compact.h
     uint64_t reclaim = block_free;
+    bool kept_only = false;   // (the textures' pool is down to its blocks made at the start: the 97% rule, below)
     if (compact_on()) {
-        uint64_t pool_blocks = 0, pool_free = 0;
-        if (textures_pool_usage(&pool_blocks, &pool_free)) reclaim = vram_compact::reclaimable(block_free, pool_free);
+        uint64_t pool_blocks = 0, pool_free = 0, pool_kept = 0;
+        if (textures_pool_usage(&pool_blocks, &pool_free, &pool_kept)) reclaim = vram_compact::reclaimable(block_free, pool_free);
+        kept_only = vram_compact::kept_only(pool_blocks, pool_kept);
     }
     const uint64_t pressure = by_blocks ? used : used - std::min(used, reclaim);
     pool_pressed = known && pressure > allowed / 10 * 9;   // (the target pool given back meanwhile)
     compact.pressed = known && vram_compact::pressed(used, allowed);   // (hookshot, RX_VK_COMPACT: by the driver's own count)
+    const uint64_t size_budget = budget;   // (the budget as a size, before the rules that take an excess off it: rule_target)
     if (known && pressure > allowed / 10 * 9) {
         const uint64_t over = pressure - allowed / 10 * 9;
         budget = std::min(budget, total_bytes > over ? total_bytes - over : 0);
@@ -4320,12 +4323,18 @@ void texture_frame(uint64_t completed) {
     // RX_VK_SQUEEZE_ALWAYS=1: as before
     static const bool squeeze_always = env_on("RX_VK_SQUEEZE_ALWAYS");
     const bool room_in_blocks = !squeeze_always && block_free >= allowed / 8;
-    if (known && !by_blocks && used > allowed / 100 * 97 && !room_in_blocks) {
+    // (nor while the textures' pool is down to its blocks made at the start, which VMA keeps: what this evicts would leave the
+    // count as it is, the same ratchet. RX_VK_SQUEEZE_ALWAYS=1 squeezes there too)
+    if (known && !by_blocks && !(kept_only && !squeeze_always) && used > allowed / 100 * 97 && !room_in_blocks) {
         const uint64_t over = used - allowed / 100 * 97;
         budget = std::min(budget, total_bytes > over ? total_bytes - over : 0);
         rule_budget = std::min(rule_budget, total_bytes > over ? total_bytes - over : 0);
     }
-    const uint64_t rule_to = vram_compact::rule_target(total_bytes, rule_budget);
+    // (hookshot) the 90% rule and the driver's limit let go of their excess, not of an eighth of the cache: vram_compact.h.
+    // RX_VK_EVICT_EXCESS=0: to 7/8 of their budget, as before
+    static const bool excess_only = !getenv("RX_VK_EVICT_EXCESS") || atoi(getenv("RX_VK_EVICT_EXCESS")) != 0;
+    const uint64_t rule_to = excess_only ? vram_compact::rule_target(total_bytes, size_budget, rule_budget)
+                                         : vram_compact::rule_target(total_bytes, rule_budget);
     // (hookshot, RX_VK_COMPACT: the driver's limit asks for more than the reserve does: a pass over the budget, to 7/8 of it, as
     // before. Rare once the reserve is set: its line is 17 points under the limit's and counts the textures' free space out, so
     // this takes more than that share of the allowance free in their pool. Otherwise the pass is the hold's, and what the
