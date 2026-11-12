@@ -24,6 +24,16 @@ Studio's C++ tools; on Linux clang and lld. For the Vulkan back end: distro Vulk
 (`RX_CPM`, else `cpm` in the clone, else the old caches in mkw-recomp's `work/eg` or `..\Eglantine\.cache\cpm`).
 Without those the standalone build stops. [CONTRIBUTING.md](../CONTRIBUTING.md#development-setup) has the rest.
 
+On Linux, `make_game.py` checks the mandatory Python modules, compilers/linker, renderer headers and FFmpeg
+development libraries before reading or translating the dump, and lists every missing prerequisite in one error.
+It uses the compile's lookup order: CPM caches first, then `HOOKSHOT_*_HEADERS`, then `/usr/local` and `/usr`;
+FFmpeg comes from `HOOKSHOT_FFMPEG` when it holds `lib/libavcodec.a`, otherwise from `pkg-config`. The C probe
+uses the selected compiler, lld and `HOOKSHOT_SYSROOT` if set. A prebuilt renderer does not need renderer headers
+unless an NGX SDK selects a source renderer instead; source builds still need clang++ for the native translator.
+The AppImage uses its bundled tools,
+and `RX_TARGET=windows` keeps the Windows toolchain checks rather than requiring Linux development libraries.
+The button-prompt packages in `nx2/prompt_requirements.txt` remain optional; this check installs nothing.
+
 Run everything with `python -I` from this folder.
 
 | Command | What |
@@ -178,6 +188,7 @@ case-sensitive, and an unknown one is ignored.
 | `RX_VK_GM_LOOP=0` or `1` | The storage buffer tables of a global memory access searched in a loop (1) or written out entry by entry (0). On by default on Intel, whose compiler did not finish the culling programs with the entries written out |
 | `RX_VK_IMPORT_CHUNK_MB=<MB>` | The size game memory is imported for the GPU by, and so a pool's VRAM mirror's least size (default 4 where the pools have VRAM mirrors, discrete cards; 16 without them, and before). Larger: fewer imports, more of each mirror outside the game's pools |
 | `RX_VK_NO_PROGRAM_CACHE` (set) | Neither reads nor writes `hookshot_programs.bin` and the pipeline notes |
+| `RX_VK_PCACHE_STAMP=0` | Keeps `mkw_vk_pipelines.bin` and its play files whatever translator made them. By default they are dropped at a start when `mkw_vk_pipelines.stamp` says another translator made them (as the program cache starts over), since their pipelines can no longer be hit |
 | `RX_VK_FETCH_BOUNDS=0` or `1`, `RX_VK_NAN_BITS=0` or `1`, `RX_VK_GATHER_OFFSET=0` or `1` | The translation's vendor and driver workarounds (`gpu/vk/vk_vendor.h`) off or on for one run, whatever the GPU; the log's `vk: vendor fixes` line says which are on. By default: out-of-bounds texel fetches answered with 0 on every GPU but NVIDIA's; NaN tests on a value's bits on AMD's older Windows shader compiler (RX 5000 and RX 6000); gathers nudged by 1/512 of a texel on AMD's and Intel's drivers. They change the shaders' translation (one preparation of the shaders) |
 | `RX_VK_NATIVE_FADD=0` or `1` | The shaders' float adds to storage buffers: 1 the GPU's own atomic where it has `VK_EXT_shader_atomic_float`'s `shaderBufferFloat32AtomicAdd`, 0 a compare-exchange loop on every GPU, the extension not enabled. By default the GPU's own on NVIDIA's driver only, the one it was tried on in the game; on AMD and Intel the loop until runs there show the native add works (the log's `vk: float atomic add on storage buffers:` line says which, and why). The loop gives up after 1024 attempts, and an add that gives up is lost |
 | `RX_VK_UB_WORD_HASH=0` | A/B test: use the old low-address-bit index for cached uniform words (default: mix upper address bits to reduce aligned-buffer collisions) |
@@ -232,6 +243,12 @@ directory and publishes only a complete set. A failed generator still removes th
 icons, as before. An interrupted builder can leave the old set without a stamp; the next build regenerates it.
 The files the game derives at run time are still cleared by every build, including a cache hit; they are not part of
 the stamp. If those files cannot be cleared, the build regenerates rather than trusting them.
+Before checking the cache, builds sweep `.prompts-*` staging directories without following links or Windows reparse
+points. POSIX uses checked directory descriptors and owner locks, with a 24-hour grace period for unmarked legacy
+directories; it skips cleanup if descriptor-safe removal is unavailable. Windows uses only the 24-hour age rule,
+even for directories with an owner marker, and never opens a leftover's owner file or compares file identities.
+Removal is best effort: a locked, in-use or otherwise unremovable directory is kept with a message, without failing
+the build.
 
 #### A faster build for development
 

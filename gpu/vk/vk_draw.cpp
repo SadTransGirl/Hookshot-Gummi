@@ -42,6 +42,7 @@
 #include "vk_fsr3_inputs.h"
 #include "reactive_policy.h"
 #include "upscaler_rows.h"
+#include "pcache_stamp.h"
 #include "vk_reactive.h"   // (the upscalers' reactive mask: the scene copied before its transparent draws)
 #include "vk_dump.h"
 #include "vk_gprof.h"
@@ -942,6 +943,33 @@ bool play_cache_in_use() { return play_cache.load() != nullptr; }
 // ---- (end of the play caches) ----
 
 bool pcache_no_save = false;   // (RX_VK_PCACHE_LOAD=0: pcache_init)
+// (RX_VK_PCACHE_LOAD=0, an A/B of what the file costs in memory: its 2.5 GB read whole and held by the driver. The cache
+// starts empty and is not saved; the driver's own shader cache is all there is)
+bool pcache_load_off() {
+    static const bool off = [] { const char* e = getenv("RX_VK_PCACHE_LOAD"); return e && env_value_off(e); }();   // (hookshot_env.h: 0/off/false/no)
+    return off;
+}
+/// (hookshot) The pipeline cache's files go when they were made for another translator than this one (program_cache_stamp,
+/// which the program cache and the prepare record start over by): their pipelines can no longer be hit, and the file only grew,
+/// read whole at every start and held by the driver (pcache_stamp.h). Once a run, before the first of pcache_init and
+/// prepare_run: whether files went, so that prepare_run makes the stage libraries the warm pass kept in them again
+/// (prepared_for.warmed), whatever its record says. RX_VK_PCACHE_STAMP=0: kept whatever made them, as before
+bool pcache_drop_stale() {
+    static const bool dropped = [] {
+        static const bool by_stamp = [] { const char* e = getenv("RX_VK_PCACHE_STAMP"); return !e || !env_value_off(e); }();
+        if (pcache_load_off() || !by_stamp) return false;
+        char exe[MAX_PATH];
+        const DWORD n = game_module_path(exe, MAX_PATH);
+        std::string dir(exe, n);
+        dir = dir.substr(0, dir.find_last_of("\\/") + 1);
+        const pcache_stamp::Dropped gone = pcache_stamp::check(dir, program_cache_stamp());
+        if (gone.files)
+            logf("vk: pipeline cache: %zu files made for another translator dropped (%llu MB); it starts empty", gone.files,
+                 (unsigned long long)(gone.bytes >> 20));
+        return gone.files > 0;
+    }();
+    return dropped;
+}
 void pcache_init() {
     if (pcache) return;
     char exe[MAX_PATH];
@@ -949,10 +977,9 @@ void pcache_init() {
     std::string dir(exe, n);
     pcache_dir = dir = dir.substr(0, dir.find_last_of("\\/") + 1);
     pcache_path = dir + "mkw_vk_pipelines.bin";
-    // (RX_VK_PCACHE_LOAD=0, an A/B of what the file costs in memory: its 2.5 GB read whole and held by the driver. The cache
-    // starts empty and is not saved; the driver's own shader cache is all there is)
-    static const bool off = getenv("RX_VK_PCACHE_LOAD") && atoi(getenv("RX_VK_PCACHE_LOAD")) == 0;
+    const bool off = pcache_load_off();
     pcache_no_save = off;
+    pcache_drop_stale();   // (before the files are read)
     std::vector<uint8_t> data = off ? std::vector<uint8_t>{} : pcache_file_read(pcache_path);
     VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     ci.initialDataSize = data.size();
@@ -8134,6 +8161,11 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background, b
     PreparedFor prepared_for;
     double hash_ms = 0;
     const PrepareWhy why = prepare_check(path, seed_path(), program_cache_stamp(), &prepared_for, &hash_ms);
+    // (hookshot) the pipeline cache's files dropped at this start (pcache_drop_stale: another translator's, or a folder from
+    // before the stamp file) took the stage libraries the warm pass had kept in them: made again, whatever the record says,
+    // once a run, by the start's own preparation (the background one in play leaves the driver's part to first use)
+    static std::atomic<bool> rewarm_once{true};
+    if (!background && pcache_drop_stale() && rewarm_once.exchange(false)) prepared_for.warmed = 0;   // (read as not made)
     const bool libraries = gpl_wanted() && !env_on("RX_VK_NO_WARM");
     const uint64_t warmed = warmed_stamp(libraries);
     const std::string warming = path + ".warming";
